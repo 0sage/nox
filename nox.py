@@ -197,98 +197,6 @@ def list_networks():
         print(f"Warning: Failed to list networks: {e}", file=sys.stderr)
         return []
 
-def list_physical_interfaces():
-    """List physical network interfaces suitable for macvtap bridging."""
-    skip = {'lo', 'virbr', 'vnet', 'docker', 'br-', 'veth', 'tun', 'tap', 'tailscale', 'lxc', 'wg', 'dummy', 'wlan'}
-    ifaces = []
-    try:
-        with open('/proc/net/dev') as f:
-            for line in f.readlines()[2:]:
-                iface = line.split(':')[0].strip()
-                # Skip virtual/loopback interfaces
-                if any(iface.startswith(s) for s in skip):
-                    continue
-                # Only include interfaces that are UP
-                result = run(f"ip link show {iface}", check=False)
-                out = result.stdout if isinstance(result.stdout, str) else result.stdout.decode()
-                if 'UP' in out:
-                    ifaces.append(iface)
-    except Exception as e:
-        print(f"Warning: Failed to list physical interfaces: {e}", file=sys.stderr)
-    return ifaces
-
-def select_network_interactive():
-    """Interactive network selection - shows both libvirt networks and physical interfaces."""
-    libvirt_nets = [n for n in list_networks() if n['state'] == 'active']
-    phys_ifaces = list_physical_interfaces()
-
-    # Build unified entry list
-    # Each entry: {'label': str, 'type': 'libvirt'|'macvtap', 'value': str}
-    entries = []
-    for n in libvirt_nets:
-        entries.append({'label': f"{n['name']}  [NAT/virtual]", 'type': 'libvirt', 'value': n['name']})
-    for iface in phys_ifaces:
-        entries.append({'label': f"{iface}  [physical - macvtap]", 'type': 'macvtap', 'value': iface})
-
-    if not entries:
-        print("No networks available. Using 'default'.")
-        return {'type': 'libvirt', 'value': 'default'}
-
-    try:
-        import curses
-
-        def _menu(stdscr):
-            curses.curs_set(0)
-            current_idx = 0
-
-            while True:
-                stdscr.clear()
-                h, w = stdscr.getmaxyx()
-                stdscr.addstr(0, 0, "Select network (↑/↓ navigate, Enter select, q quit):", curses.A_BOLD)
-                stdscr.addstr(1, 0, "-" * min(w - 1, 70))
-
-                for idx, entry in enumerate(entries):
-                    y = idx + 3
-                    if y >= h - 1:
-                        break
-                    if idx == current_idx:
-                        stdscr.addstr(y, 0, f"> {entry['label']}", curses.A_REVERSE)
-                    else:
-                        stdscr.addstr(y, 0, f"  {entry['label']}")
-
-                stdscr.refresh()
-                key = stdscr.getch()
-
-                if key == curses.KEY_UP and current_idx > 0:
-                    current_idx -= 1
-                elif key == curses.KEY_DOWN and current_idx < len(entries) - 1:
-                    current_idx += 1
-                elif key == ord('\n'):
-                    return entries[current_idx]
-                elif key in (ord('q'), ord('Q')):
-                    return None
-
-        result = curses.wrapper(_menu)
-        if result:
-            return result
-        print("Network selection cancelled.")
-        sys.exit(0)
-
-    except Exception:
-        # Fallback: numbered list
-        print("\nAvailable networks:")
-        for idx, entry in enumerate(entries, 1):
-            print(f"  {idx}. {entry['label']}")
-        while True:
-            try:
-                choice = input(f"\nSelect network (1-{len(entries)}): ").strip()
-                idx = int(choice) - 1
-                if 0 <= idx < len(entries):
-                    return entries[idx]
-                print(f"Invalid choice. Please enter 1-{len(entries)}")
-            except (ValueError, KeyboardInterrupt):
-                print("\nNetwork selection cancelled.")
-                sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # S3 Helper Functions
@@ -573,16 +481,11 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     if password is None:
         password = generate_password()
 
-    # Resolve network spec: accept dict (from interactive) or plain string
+    # Use default libvirt network
     if network is None:
-        network = {'type': 'libvirt', 'value': 'nox-net'}
-    elif isinstance(network, str):
-        network = {'type': 'libvirt', 'value': network}
+        network = 'default'
 
-    if network['type'] == 'macvtap':
-        network_arg = f"type=direct,source={network['value']},source_mode=bridge,model=virtio"
-    else:
-        network_arg = f"network={network['value']},model=virtio"
+    network_arg = f"network={network},model=virtio"
 
     print(f"Creating VM '{name}': os={os_name} vcpus={vcpus} ram={ram_mb}MB disk={disk_gb}GB")
 
@@ -674,8 +577,7 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
         "ram_mb": ram_mb,
         "disk_gb": disk_gb,
         "autostart": autostart,
-        "network_type": network['type'],
-        "network_value": network['value'],
+        "network": network,
     }
     save_meta(name, meta)
 
@@ -692,19 +594,9 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
 
 def cmd_create(args):
     """Create a new VM and show SSH credentials."""
-    # Use network from args or prompt for selection
-    network = getattr(args, "network", None)
-    
-    if network is None:
-        network = select_network_interactive()
-    else:
-        # Detect if the --network arg is a physical interface or a libvirt network
-        phys = list_physical_interfaces()
-        if network in phys:
-            network = {'type': 'macvtap', 'value': network}
-        else:
-            network = {'type': 'libvirt', 'value': network}
-    
+    # Use default network or network from args
+    network = getattr(args, "network", None) or 'default'
+
     success, password = create_vm(
         args.name, os_name=args.os, cpus=args.cpus, ram=args.ram,
         disk=args.disk, autostart=not getattr(args, "no_autostart", False),
@@ -754,38 +646,6 @@ def cmd_restart(args):
     virsh(f"reboot {args.name}")
     print(f"VM '{args.name}' restarted.")
 
-def cleanup_macvtap(name):
-    """Remove the macvtap interface belonging to a specific VM."""
-    try:
-        # Get the VM's MAC address from its XML before it's undefined
-        result = virsh(f"dumpxml {name}", check=False)
-        if result.returncode != 0:
-            return
-        out = result.stdout if isinstance(result.stdout, str) else result.stdout.decode()
-
-        import re
-        # Find MAC addresses used by this VM
-        macs = set(m.lower() for m in re.findall(r"mac address='([^']+)'", out))
-        if not macs:
-            return
-
-        # Find macvtap interfaces matching those MACs
-        links = run("ip link show", check=False)
-        links_out = links.stdout if isinstance(links.stdout, str) else links.stdout.decode()
-
-        current_iface = None
-        for line in links_out.splitlines():
-            if "macvtap" in line and ":" in line:
-                current_iface = line.split(":")[1].strip().split("@")[0]
-            elif current_iface and "link/ether" in line:
-                mac = line.strip().split()[1].lower()
-                if mac in macs:
-                    run(f"ip link delete {current_iface}", check=False)
-                    print(f"Removed macvtap interface {current_iface}")
-                current_iface = None
-    except Exception as e:
-        print(f"Warning: macvtap cleanup failed: {e}", file=sys.stderr)
-
 def cmd_delete(args):
     if not vm_exists(args.name):
         d = vm_dir(args.name)
@@ -800,7 +660,6 @@ def cmd_delete(args):
     if state == "running":
         virsh(f"destroy {args.name}")
 
-    cleanup_macvtap(args.name)
     virsh(f"undefine {args.name} --nvram --remove-all-storage")
     d = vm_dir(args.name)
     if os.path.exists(d):
@@ -1250,7 +1109,6 @@ def cmd_restore(args):
         state = vm_state(restore_name)
         if state == "running":
             virsh(f"destroy {restore_name}")
-        cleanup_macvtap(restore_name)
         virsh(f"undefine {restore_name} --nvram --remove-all-storage", check=False)
 
     print(f"Restoring VM '{restore_name}' from backup '{backup_name}'...")
@@ -1455,7 +1313,7 @@ def main():
     p.add_argument("--cpus", type=float, default=None)
     p.add_argument("--ram", type=float, default=None)
     p.add_argument("--disk", type=float, default=None)
-    p.add_argument("--network", type=str, default=None, help="Libvirt network to use (if not specified, interactive selection)")
+    p.add_argument("--network", type=str, default=None, help="Libvirt network to use (default: 'default')")
     p.add_argument("--no-autostart", action="store_true", help="Disable autostart on boot")
     p.add_argument("--no-start", action="store_true", help="Create but don't start VM")
 
