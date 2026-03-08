@@ -706,6 +706,26 @@ def cmd_list(args):
 
         print(f"{name:<20} {state:<15} {os_name:<10} {vcpus:<6} {ram_str:<8} {disk_str:<8} {auto_str:<10} {ip}")
 
+def ensure_ssh_key():
+    """Ensure SSH key exists, generate if needed."""
+    ssh_dir = os.path.expanduser("~/.ssh")
+    key_path = os.path.join(ssh_dir, "id_ed25519")
+    pub_key_path = f"{key_path}.pub"
+
+    if os.path.exists(pub_key_path):
+        return
+
+    # Create .ssh directory if it doesn't exist
+    os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+
+    # Generate SSH key silently
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", "", "-C", f"nox@{os.uname().nodename}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True
+    )
+
 def cmd_ssh(args):
     if not vm_exists(args.name):
         print(f"VM '{args.name}' does not exist.", file=sys.stderr)
@@ -715,6 +735,9 @@ def cmd_ssh(args):
     if state != "running":
         print(f"VM '{args.name}' is not running. Start it with: nox start {args.name}", file=sys.stderr)
         sys.exit(1)
+
+    # Ensure SSH key exists
+    ensure_ssh_key()
 
     # Get VM IP address
     print(f"Getting IP address for '{args.name}'...")
