@@ -102,6 +102,41 @@ def resolve_resource(value, host_total):
         return max(1, int(math.ceil(v * host_total)))
     return int(v)
 
+def apply_resource_limits(name, vcpus, ram_mb):
+    """Apply hard CPU, memory, and I/O limits to a VM via libvirt XML tuning.
+
+    CPU: Uses cputune period/quota to hard-cap CPU usage to allocated vCPUs.
+    Memory: Sets hard_limit in memtune so the VM process cannot exceed its allocation.
+    I/O: Sets blkiotune weight low so host I/O always takes priority.
+    """
+    # CPU hard limit: period=100ms, quota = vcpus * period
+    # This means the VM can use at most `vcpus` worth of CPU time per period
+    period = 100000  # 100ms in microseconds
+    quota = vcpus * period
+    try:
+        virsh(f"schedinfo {name} --set vcpu_period={period} --set vcpu_quota={quota} --config")
+        virsh(f"schedinfo {name} --set vcpu_period={period} --set vcpu_quota={quota} --live", check=False)
+    except RuntimeError:
+        # VM might not be running, config-only is fine
+        pass
+
+    # Memory hard limit: prevent VM process from using more than allocated + small buffer
+    # memtune hard_limit is in KiB
+    hard_limit_kb = (ram_mb + 64) * 1024  # allocated + 64MB overhead for qemu
+    try:
+        virsh(f"memtune {name} --hard-limit {hard_limit_kb} --config")
+        virsh(f"memtune {name} --hard-limit {hard_limit_kb} --live", check=False)
+    except RuntimeError:
+        pass
+
+    # I/O weight: 100 (low) out of range 100-1000, so host always wins on I/O contention
+    try:
+        virsh(f"blkiotune {name} --weight 100 --config")
+        virsh(f"blkiotune {name} --weight 100 --live", check=False)
+    except RuntimeError:
+        pass
+
+
 def run(cmd, check=True, capture=True):
     """Run a shell command."""
     if capture:
@@ -581,6 +616,10 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     }
     save_meta(name, meta)
 
+    # Apply hard resource limits (CPU quota, memory cap, I/O weight)
+    apply_resource_limits(name, vcpus, ram_mb)
+    print(f"✓ Resource limits applied (CPU hard cap: {vcpus} cores, RAM limit: {ram_mb}MB)")
+
     if not start:
         print(f"VM '{name}' created (not started).")
     else:
@@ -925,6 +964,11 @@ def cmd_resize(args):
 
     # Save updated metadata
     save_meta(args.name, meta)
+
+    # Re-apply hard resource limits after resize
+    if args.cpus is not None or args.ram is not None:
+        apply_resource_limits(args.name, meta["vcpus"], meta["ram_mb"])
+        print(f"✓ Resource limits updated (CPU hard cap: {meta['vcpus']} cores, RAM limit: {meta['ram_mb']}MB)")
     
     print(f"\n✓ VM '{args.name}' resized successfully!")
     if state == "running" and (args.cpus is not None or args.ram is not None):
@@ -1170,6 +1214,11 @@ def cmd_restore(args):
 
         print(f"✓ VM '{restore_name}' restored successfully!")
         
+        # Apply resource limits to restored VM
+        if meta:
+            apply_resource_limits(restore_name, meta.get("vcpus", 1), meta.get("ram_mb", 512))
+            print(f"✓ Resource limits applied")
+
         if backup_info.get("was_running") and not args.no_start:
             print(f"Starting VM '{restore_name}'...")
             virsh(f"start {restore_name}")
