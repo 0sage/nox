@@ -196,6 +196,196 @@ def generate_password():
     return ''.join(secrets.choice(alphabet) for _ in range(12))
 
 # ---------------------------------------------------------------------------
+# Bridge networking
+# ---------------------------------------------------------------------------
+
+BRIDGE_NAME = "br0"
+BRIDGE_CONF = "/etc/network/interfaces.d/br0"
+LIBVIRT_NET = "bridged"
+
+def detect_primary_interface():
+    """Detect the primary physical network interface (the one with the default route)."""
+    result = run("ip route show default", check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return "eth0"
+    # "default via 10.0.0.1 dev eth0 ..."
+    parts = result.stdout.strip().split()
+    for i, p in enumerate(parts):
+        if p == "dev" and i + 1 < len(parts):
+            iface = parts[i + 1]
+            # If already on br0, find the enslaved physical interface
+            if iface == BRIDGE_NAME:
+                br_result = run(f"ls /sys/devices/virtual/net/{BRIDGE_NAME}/brif/", check=False)
+                if br_result.returncode == 0 and br_result.stdout.strip():
+                    return br_result.stdout.strip().split()[0]
+            return iface
+    return "eth0"
+
+def bridge_exists():
+    """Check if br0 bridge already exists."""
+    return os.path.exists(f"/sys/class/net/{BRIDGE_NAME}")
+
+def libvirt_net_exists():
+    """Check if the bridged libvirt network is defined."""
+    result = virsh(f"net-info {LIBVIRT_NET}", check=False)
+    return result.returncode == 0
+
+def get_interface_config():
+    """Read current IP config from the primary interface or bridge."""
+    iface = BRIDGE_NAME if bridge_exists() else detect_primary_interface()
+    result = run(f"ip -4 addr show {iface}", check=False)
+    if result.returncode != 0:
+        return None, None, None
+    ip_cidr = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            ip_cidr = line.split()[1]
+            break
+    if not ip_cidr:
+        return None, None, None
+    # Get gateway
+    gw_result = run("ip route show default", check=False)
+    gateway = None
+    if gw_result.returncode == 0:
+        for part in gw_result.stdout.split():
+            if part.count('.') == 3 and not part.startswith("src"):
+                # Find the token after "via"
+                parts = gw_result.stdout.split()
+                for i, p in enumerate(parts):
+                    if p == "via" and i + 1 < len(parts):
+                        gateway = parts[i + 1]
+                        break
+                break
+    # Get DNS from dhcpcd or resolv.conf
+    dns = None
+    resolv = run("grep nameserver /etc/resolv.conf", check=False)
+    if resolv.returncode == 0:
+        for line in resolv.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "nameserver" and not parts[1].startswith("127"):
+                dns = parts[1]
+                break
+    return ip_cidr, gateway, dns
+
+def ensure_bridge():
+    """Create br0 bridge and bridged libvirt network if they don't exist."""
+    if bridge_exists() and libvirt_net_exists():
+        # Ensure libvirt network is started
+        virsh(f"net-start {LIBVIRT_NET}", check=False)
+        return True
+
+    phys_iface = detect_primary_interface()
+    # Don't bridge if already on br0
+    if phys_iface == BRIDGE_NAME:
+        if not libvirt_net_exists():
+            _create_libvirt_bridged_net()
+        virsh(f"net-start {LIBVIRT_NET}", check=False)
+        return True
+
+    ip_cidr, gateway, dns = get_interface_config()
+    if not ip_cidr or not gateway:
+        print(f"Error: Could not detect IP config on {phys_iface}", file=sys.stderr)
+        return False
+
+    print(f"Setting up bridge {BRIDGE_NAME} on {phys_iface} ({ip_cidr})...")
+
+    if not bridge_exists():
+        # Install bridge-utils if needed
+        run("dpkg -s bridge-utils >/dev/null 2>&1 || sudo apt-get install -y -qq bridge-utils", check=False)
+
+        # Write bridge config for persistence
+        dns_line = f"    dns-nameservers {dns}" if dns else ""
+        conf = f"""# Managed by nox
+auto {BRIDGE_NAME}
+iface {BRIDGE_NAME} inet static
+    bridge_ports {phys_iface}
+    bridge_stp off
+    bridge_fd 0
+    address {ip_cidr}
+    gateway {gateway}
+{dns_line}
+
+# Physical interface must be manual when bridged
+auto {phys_iface}
+iface {phys_iface} inet manual
+"""
+        run(f"sudo tee {BRIDGE_CONF} > /dev/null << 'NOXEOF'\n{conf}NOXEOF")
+
+        # Create bridge live (without losing SSH)
+        run(f"sudo ip link add name {BRIDGE_NAME} type bridge", check=False)
+        run(f"sudo ip link set {BRIDGE_NAME} up")
+        run(f"sudo ip link set {phys_iface} master {BRIDGE_NAME}")
+
+        # Move IP from phys to bridge
+        ip_addr = ip_cidr.split('/')[0]
+        run(f"sudo ip addr add {ip_cidr} dev {BRIDGE_NAME}", check=False)
+        run(f"sudo ip addr del {ip_cidr} dev {phys_iface}", check=False)
+        run(f"sudo ip route add default via {gateway} dev {BRIDGE_NAME} src {ip_addr}", check=False)
+
+        # Stop dhcpcd on the physical interface to prevent it reclaiming the IP
+        run(f"sudo dhcpcd --release {phys_iface} 2>/dev/null", check=False)
+        run(f"sudo ip addr flush dev {phys_iface}", check=False)
+
+        print(f"✓ Bridge {BRIDGE_NAME} created on {phys_iface}")
+
+    if not libvirt_net_exists():
+        _create_libvirt_bridged_net()
+
+    return True
+
+def _create_libvirt_bridged_net():
+    """Define and start the bridged libvirt network."""
+    net_xml = f"""<network>
+  <name>{LIBVIRT_NET}</name>
+  <forward mode="bridge"/>
+  <bridge name="{BRIDGE_NAME}"/>
+</network>"""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
+        f.write(net_xml)
+        tmp = f.name
+    try:
+        virsh(f"net-define {tmp}")
+        virsh(f"net-start {LIBVIRT_NET}", check=False)
+        virsh(f"net-autostart {LIBVIRT_NET}")
+        print(f"✓ Libvirt network '{LIBVIRT_NET}' created")
+    finally:
+        os.unlink(tmp)
+
+def remove_bridge():
+    """Remove br0 bridge and restore direct interface config."""
+    phys_iface = detect_primary_interface()
+    ip_cidr, gateway, dns = get_interface_config()
+
+    # Remove libvirt network
+    if libvirt_net_exists():
+        virsh(f"net-destroy {LIBVIRT_NET}", check=False)
+        virsh(f"net-undefine {LIBVIRT_NET}", check=False)
+        print(f"✓ Libvirt network '{LIBVIRT_NET}' removed")
+
+    # Remove bridge
+    if bridge_exists():
+        # Move IP back to physical interface
+        if ip_cidr and phys_iface:
+            ip_addr = ip_cidr.split('/')[0]
+            run(f"sudo ip addr add {ip_cidr} dev {phys_iface}", check=False)
+            run(f"sudo ip link set {phys_iface} nomaster", check=False)
+            run(f"sudo ip link delete {BRIDGE_NAME}", check=False)
+            run(f"sudo ip route add default via {gateway} dev {phys_iface} src {ip_addr}", check=False)
+        else:
+            run(f"sudo ip link delete {BRIDGE_NAME}", check=False)
+
+        # Remove config file
+        if os.path.exists(BRIDGE_CONF):
+            run(f"sudo rm -f {BRIDGE_CONF}")
+
+        # Restart dhcpcd to reclaim the interface
+        run("sudo systemctl restart dhcpcd", check=False)
+
+        print(f"✓ Bridge {BRIDGE_NAME} removed, {phys_iface} restored")
+
+# ---------------------------------------------------------------------------
 # Cloud-init generation
 # ---------------------------------------------------------------------------
 
@@ -273,9 +463,13 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     if password is None:
         password = generate_password()
 
-    # Use default libvirt network
+    # Ensure bridge network is set up
     if network is None:
-        network = 'default'
+        network = LIBVIRT_NET
+    if network == LIBVIRT_NET:
+        if not ensure_bridge():
+            print("Error: Failed to set up bridge network.", file=sys.stderr)
+            return False, None
 
     network_arg = f"network={network},model=virtio"
 
@@ -390,8 +584,7 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
 
 def cmd_create(args):
     """Create a new VM and show SSH credentials."""
-    # Use default network or network from args
-    network = getattr(args, "network", None) or 'default'
+    network = getattr(args, "network", None)
 
     success, password = create_vm(
         args.name, os_name=args.os, cpus=args.cpus, ram=args.ram,
@@ -720,6 +913,45 @@ def cmd_resize(args):
         print(f"VM state: shut off (use 'nox start {args.name}' to start)")
 
 
+def cmd_purge(args):
+    """Remove all VMs, bridge, libvirt networks, and nox data."""
+    print("This will destroy ALL VMs, remove the bridge, and delete all nox data.")
+    if not args.force:
+        try:
+            answer = input("Are you sure? [y/N] ")
+            if answer.lower() != 'y':
+                print("Cancelled.")
+                return
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            return
+
+    # Destroy and undefine all VMs
+    result = virsh("list --all --name", check=False)
+    if result.returncode == 0:
+        for name in result.stdout.strip().splitlines():
+            name = name.strip()
+            if not name:
+                continue
+            print(f"Deleting VM '{name}'...")
+            if vm_state(name) == "running":
+                virsh(f"destroy {name}", check=False)
+            virsh(f"undefine {name} --nvram --remove-all-storage", check=False)
+
+    # Remove bridge and libvirt network
+    remove_bridge()
+
+    # Remove default NAT network if it exists
+    virsh(f"net-destroy default", check=False)
+
+    # Remove nox data directory
+    if os.path.exists(NOX_DIR):
+        shutil.rmtree(NOX_DIR)
+        print(f"✓ Removed {NOX_DIR}")
+
+    print("\n✓ nox purged. All VMs, networks, and data removed.")
+
+
 def cmd_update(args):
     """Update nox to the latest version from GitHub."""
     import tempfile
@@ -778,7 +1010,7 @@ def main():
     p.add_argument("--cpus", type=float, default=None)
     p.add_argument("--ram", type=float, default=None)
     p.add_argument("--disk", type=float, default=None)
-    p.add_argument("--network", type=str, default=None, help="Libvirt network to use (default: 'default')")
+    p.add_argument("--network", type=str, default=None, help="Libvirt network (default: bridged)")
     p.add_argument("--no-autostart", action="store_true", help="Disable autostart on boot")
     p.add_argument("--no-start", action="store_true", help="Create but don't start VM")
 
@@ -824,6 +1056,10 @@ def main():
     # update
     sub.add_parser("update", aliases=["up"], help="Update nox")
 
+    # purge
+    p = sub.add_parser("purge", help="Remove ALL VMs, bridge, and nox data")
+    p.add_argument("--force", "-f", action="store_true", help="Skip confirmation")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -845,6 +1081,7 @@ def main():
         "resize": cmd_resize,
         "update": cmd_update,
         "up": cmd_update,
+        "purge": cmd_purge,
     }
 
     cmd_func = commands.get(args.command)
