@@ -102,126 +102,41 @@ def resolve_resource(value, host_total):
         return max(1, int(math.ceil(v * host_total)))
     return int(v)
 
+# ---------------------------------------------------------------------------
+# CPU Core Management
+# ---------------------------------------------------------------------------
+# Core 0 is always reserved for the host. The core map is rebuilt from
+# VM metadata on every lifecycle event (create/resize/delete/restore)
+# to keep pinning evenly distributed.
 
-
-
-
-
-def get_core_load():
-    """Get current vCPU-to-core assignments across all VMs. Returns dict {core: count}.
-    Core 0 is reserved for the host and excluded."""
-    total = host_cpus()
-    # Initialize available cores (skip core 0)
-    load = {c: 0 for c in range(1, total)}
-
-    if not os.path.exists(VMS_DIR):
-        return load
-
-    for vm_name in os.listdir(VMS_DIR):
-        meta = load_meta(vm_name)
-        if not meta:
-            continue
-        pinned = meta.get("pinned_cores", [])
-        for core in pinned:
-            if core in load:
-                load[core] += 1
-
-    return load
-
-
-def allocate_cores(vcpus, exclude_vm=None):
-    """Allocate cores for a VM using least-loaded strategy.
-    Returns list of core IDs, one per vCPU. Cores can repeat (oversubscription)."""
+def rebuild_core_map():
+    """Rebuild the core map from all VM metadata and repin everything.
+    This is the single source of truth for CPU distribution."""
     total = host_cpus()
     if total <= 1:
-        return [0]
+        return
 
-    # Get current load, excluding the VM being resized
-    load = {c: 0 for c in range(1, total)}
+    available_cores = list(range(1, total))
+
+    # Collect all VMs that have metadata
+    vms = []
     if os.path.exists(VMS_DIR):
-        for vm_name in os.listdir(VMS_DIR):
-            if vm_name == exclude_vm:
-                continue
+        for vm_name in sorted(os.listdir(VMS_DIR)):
             meta = load_meta(vm_name)
             if not meta:
                 continue
-            for core in meta.get("pinned_cores", []):
-                if core in load:
-                    load[core] += 1
-
-    # Assign each vCPU to the least-loaded core
-    assigned = []
-    for _ in range(vcpus):
-        core = min(load, key=load.get)
-        assigned.append(core)
-        load[core] += 1
-
-    return assigned
-
-
-def apply_resource_limits(name, vcpus, ram_mb):
-    """Pin VM vCPUs to specific host cores using least-loaded allocation.
-
-    Core 0 is always reserved for the host. Each vCPU is pinned to the
-    least-loaded available core, allowing oversubscription across VMs.
-    """
-    total = host_cpus()
-    if total <= 1:
-        return
-
-    cores = allocate_cores(vcpus, exclude_vm=name)
-
-    # Pin each vCPU to its assigned core
-    for i, core in enumerate(cores):
-        try:
-            virsh(f"vcpupin {name} {i} {core} --config")
-            virsh(f"vcpupin {name} {i} {core} --live", check=False)
-        except RuntimeError:
-            pass
-
-    # Pin emulator threads to all assigned cores (deduplicated)
-    unique_cores = sorted(set(cores))
-    pin_str = ",".join(str(c) for c in unique_cores)
-    try:
-        virsh(f"emulatorpin {name} {pin_str} --config")
-        virsh(f"emulatorpin {name} {pin_str} --live", check=False)
-    except RuntimeError:
-        pass
-
-    # Save pinning in metadata for future allocation decisions
-    meta = load_meta(name)
-    if meta:
-        meta["pinned_cores"] = cores
-        save_meta(name, meta)
-
-def rebalance_all_vms():
-    """Rebalance CPU pinning across all existing VMs using least-loaded allocation.
-    Called after VM create, delete, or resize to keep distribution optimal."""
-    total = host_cpus()
-    if total <= 1:
-        return
-
-    if not os.path.exists(VMS_DIR):
-        return
-
-    # Collect all VMs with their vCPU counts
-    vms = []
-    for vm_name in os.listdir(VMS_DIR):
-        meta = load_meta(vm_name)
-        if not meta:
-            continue
-        vms.append((vm_name, meta.get("vcpus", 1)))
+            vms.append((vm_name, meta.get("vcpus", 1)))
 
     if not vms:
         return
 
-    # Sort by vCPU count descending — allocate biggest VMs first for better distribution
+    # Sort by vCPU count descending — biggest VMs first for better spread
     vms.sort(key=lambda x: x[1], reverse=True)
 
-    # Fresh load map
-    load = {c: 0 for c in range(1, total)}
+    # Fresh load counter
+    load = {c: 0 for c in available_cores}
 
-    # Allocate cores for each VM
+    # Allocate and pin each VM
     for vm_name, vcpus in vms:
         cores = []
         for _ in range(vcpus):
@@ -229,7 +144,7 @@ def rebalance_all_vms():
             cores.append(core)
             load[core] += 1
 
-        # Apply pinning
+        # Apply pinning to libvirt
         for i, core in enumerate(cores):
             try:
                 virsh(f"vcpupin {vm_name} {i} {core} --config")
@@ -237,24 +152,44 @@ def rebalance_all_vms():
             except RuntimeError:
                 pass
 
-        unique_cores = sorted(set(cores))
-        pin_str = ",".join(str(c) for c in unique_cores)
+        unique = sorted(set(cores))
+        pin_str = ",".join(str(c) for c in unique)
         try:
             virsh(f"emulatorpin {vm_name} {pin_str} --config")
             virsh(f"emulatorpin {vm_name} {pin_str} --live", check=False)
         except RuntimeError:
             pass
 
-        # Update metadata
+        # Save pinning in VM metadata
         meta = load_meta(vm_name)
         if meta:
             meta["pinned_cores"] = cores
             save_meta(vm_name, meta)
 
-    # Print distribution
+    # Print the map
     print(f"Core allocation (core 0 reserved for host):")
-    for core in sorted(load):
+    for core in available_cores:
         print(f"  Core {core}: {load[core]} vCPU(s)")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -766,8 +701,8 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     }
     save_meta(name, meta)
 
-    # Rebalance CPU pinning across all VMs (reserve core 0 for host)
-    rebalance_all_vms()
+    # Rebuild CPU core map across all VMs (core 0 reserved for host)
+    rebuild_core_map()
 
     if not start:
         print(f"VM '{name}' created (not started).")
@@ -814,13 +749,19 @@ def cmd_create(args):
         print(f"{'='*60}")
 
 
+
 def cmd_start(args):
     if not vm_exists(args.name):
         print(f"VM '{args.name}' does not exist.", file=sys.stderr)
         sys.exit(1)
+    state = vm_state(args.name)
+    if state == "running":
+        print(f"VM '{args.name}' is already running.")
+        return
     strip_unsupported_tuning(args.name)
     virsh(f"start {args.name}")
     print(f"VM '{args.name}' started.")
+
 
 
 def cmd_stop(args):
@@ -858,8 +799,8 @@ def cmd_delete(args):
         shutil.rmtree(d)
     print(f"VM '{args.name}' deleted.")
 
-    # Rebalance remaining VMs now that this one is gone
-    rebalance_all_vms()
+    # Rebuild core map now that this VM is gone
+    rebuild_core_map()
 
 
 def cmd_list(args):
@@ -1103,9 +1044,9 @@ def cmd_resize(args):
     # Save updated metadata
     save_meta(args.name, meta)
 
-    # Re-apply CPU pinning after resize
+    # Rebuild CPU core map after resize
     if args.cpus is not None or args.ram is not None:
-        rebalance_all_vms()
+        rebuild_core_map()
 
     # Restart once at the end if we shut it down
     if needs_shutdown:
@@ -1358,8 +1299,8 @@ def cmd_restore(args):
 
         print(f"✓ VM '{restore_name}' restored successfully!")
         
-        # Rebalance CPU pinning across all VMs
-        rebalance_all_vms()
+        # Rebuild CPU core map across all VMs
+        rebuild_core_map()
 
         if backup_info.get("was_running") and not args.no_start:
             print(f"Starting VM '{restore_name}'...")
