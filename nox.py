@@ -194,6 +194,69 @@ def apply_resource_limits(name, vcpus, ram_mb):
         meta["pinned_cores"] = cores
         save_meta(name, meta)
 
+def rebalance_all_vms():
+    """Rebalance CPU pinning across all existing VMs using least-loaded allocation.
+    Called after VM create, delete, or resize to keep distribution optimal."""
+    total = host_cpus()
+    if total <= 1:
+        return
+
+    if not os.path.exists(VMS_DIR):
+        return
+
+    # Collect all VMs with their vCPU counts
+    vms = []
+    for vm_name in os.listdir(VMS_DIR):
+        meta = load_meta(vm_name)
+        if not meta:
+            continue
+        vms.append((vm_name, meta.get("vcpus", 1)))
+
+    if not vms:
+        return
+
+    # Sort by vCPU count descending — allocate biggest VMs first for better distribution
+    vms.sort(key=lambda x: x[1], reverse=True)
+
+    # Fresh load map
+    load = {c: 0 for c in range(1, total)}
+
+    # Allocate cores for each VM
+    for vm_name, vcpus in vms:
+        cores = []
+        for _ in range(vcpus):
+            core = min(load, key=load.get)
+            cores.append(core)
+            load[core] += 1
+
+        # Apply pinning
+        for i, core in enumerate(cores):
+            try:
+                virsh(f"vcpupin {vm_name} {i} {core} --config")
+                virsh(f"vcpupin {vm_name} {i} {core} --live", check=False)
+            except RuntimeError:
+                pass
+
+        unique_cores = sorted(set(cores))
+        pin_str = ",".join(str(c) for c in unique_cores)
+        try:
+            virsh(f"emulatorpin {vm_name} {pin_str} --config")
+            virsh(f"emulatorpin {vm_name} {pin_str} --live", check=False)
+        except RuntimeError:
+            pass
+
+        # Update metadata
+        meta = load_meta(vm_name)
+        if meta:
+            meta["pinned_cores"] = cores
+            save_meta(vm_name, meta)
+
+    # Print distribution
+    print(f"Core allocation (core 0 reserved for host):")
+    for core in sorted(load):
+        print(f"  Core {core}: {load[core]} vCPU(s)")
+
+
 
 
 
@@ -703,11 +766,8 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     }
     save_meta(name, meta)
 
-    # Apply CPU pinning (reserve core 0 for host)
-    apply_resource_limits(name, vcpus, ram_mb)
-    meta = load_meta(name)
-    pins = meta.get("pinned_cores", []) if meta else []
-    print(f"✓ CPU pinned to cores {pins} (core 0 reserved for host)")
+    # Rebalance CPU pinning across all VMs (reserve core 0 for host)
+    rebalance_all_vms()
 
     if not start:
         print(f"VM '{name}' created (not started).")
@@ -777,6 +837,7 @@ def cmd_restart(args):
     virsh(f"reboot {args.name}")
     print(f"VM '{args.name}' restarted.")
 
+
 def cmd_delete(args):
     if not vm_exists(args.name):
         d = vm_dir(args.name)
@@ -796,6 +857,10 @@ def cmd_delete(args):
     if os.path.exists(d):
         shutil.rmtree(d)
     print(f"VM '{args.name}' deleted.")
+
+    # Rebalance remaining VMs now that this one is gone
+    rebalance_all_vms()
+
 
 def cmd_list(args):
     result = virsh("list --all", check=False)
@@ -1040,10 +1105,7 @@ def cmd_resize(args):
 
     # Re-apply CPU pinning after resize
     if args.cpus is not None or args.ram is not None:
-        apply_resource_limits(args.name, meta["vcpus"], meta["ram_mb"])
-        updated_meta = load_meta(args.name)
-        pins = updated_meta.get("pinned_cores", []) if updated_meta else []
-        print(f"✓ CPU pinned to cores {pins} (core 0 reserved for host)")
+        rebalance_all_vms()
 
     # Restart once at the end if we shut it down
     if needs_shutdown:
@@ -1296,10 +1358,8 @@ def cmd_restore(args):
 
         print(f"✓ VM '{restore_name}' restored successfully!")
         
-        # Apply CPU pinning to restored VM
-        if meta:
-            apply_resource_limits(restore_name, meta.get("vcpus", 1), meta.get("ram_mb", 512))
-            print(f"✓ CPU pinning applied")
+        # Rebalance CPU pinning across all VMs
+        rebalance_all_vms()
 
         if backup_info.get("was_running") and not args.no_start:
             print(f"Starting VM '{restore_name}'...")
