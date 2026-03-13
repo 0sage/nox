@@ -611,6 +611,8 @@ def cmd_create(args):
             print(f"  IP not detected yet. Use 'nox list' to find it.")
         print(f"\nConnect via SSH:")
         print(f"  nox ssh {args.name}")
+        if ip:
+            print(f"  sshpass -p '{password}' ssh -o StrictHostKeyChecking=no nox@{ip}")
         print(f"\nIMPORTANT: Save this password - it won't be shown again!")
         print(f"{'='*60}")
 
