@@ -130,6 +130,27 @@ def apply_resource_limits(name, vcpus, ram_mb):
     except RuntimeError:
         pass
 
+def strip_blkiotune(name):
+    """Remove blkiotune weight from VM XML config (incompatible with some I/O schedulers)."""
+    result = virsh(f"dumpxml {name} --inactive", check=False)
+    if result.returncode != 0:
+        return
+    xml = result.stdout if isinstance(result.stdout, str) else result.stdout.decode()
+    if "<blkiotune>" not in xml:
+        return
+    # Remove the entire blkiotune block
+    import re
+    cleaned = re.sub(r'\s*<blkiotune>.*?</blkiotune>', '', xml, flags=re.DOTALL)
+    if cleaned != xml:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tmp:
+            tmp.write(cleaned)
+            tmp_path = tmp.name
+        try:
+            virsh(f"define {tmp_path}")
+        finally:
+            os.unlink(tmp_path)
+
+
 
 
 def run(cmd, check=True, capture=True):
@@ -659,12 +680,15 @@ def cmd_create(args):
         print(f"\nIMPORTANT: Save this password - it won't be shown again!")
         print(f"{'='*60}")
 
+
 def cmd_start(args):
     if not vm_exists(args.name):
         print(f"VM '{args.name}' does not exist.", file=sys.stderr)
         sys.exit(1)
+    strip_blkiotune(args.name)
     virsh(f"start {args.name}")
     print(f"VM '{args.name}' started.")
+
 
 def cmd_stop(args):
     if not vm_exists(args.name):
@@ -949,6 +973,7 @@ def cmd_resize(args):
     # Restart once at the end if we shut it down
     if needs_shutdown:
         print("Restarting VM...")
+        strip_blkiotune(args.name)
         virsh(f"start {args.name}")
 
     print(f"\n✓ VM '{args.name}' resized successfully!")
