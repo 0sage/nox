@@ -109,19 +109,23 @@ def resolve_resource(value, host_total):
 # VM metadata on every lifecycle event (create/resize/delete/restore)
 # to keep pinning evenly distributed.
 
+
 def rebuild_core_map():
     """Rebuild the core map from all VM metadata and repin everything.
-    This is the single source of truth for CPU distribution."""
+    This is the single source of truth for CPU distribution.
+    Only counts VMs that exist in libvirt — stale directories are ignored."""
     total = host_cpus()
     if total <= 1:
         return
 
     available_cores = list(range(1, total))
 
-    # Collect all VMs that have metadata
+    # Collect only VMs that exist in libvirt
     vms = []
     if os.path.exists(VMS_DIR):
         for vm_name in sorted(os.listdir(VMS_DIR)):
+            if not vm_exists(vm_name):
+                continue
             meta = load_meta(vm_name)
             if not meta:
                 continue
@@ -170,6 +174,7 @@ def rebuild_core_map():
     print(f"Core allocation (core 0 reserved for host):")
     for core in available_cores:
         print(f"  Core {core}: {load[core]} vCPU(s)")
+
 
 
 
