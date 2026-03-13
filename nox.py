@@ -874,6 +874,7 @@ def cmd_passwd(args):
         print(f"Failed to change password: {e}", file=sys.stderr)
         sys.exit(1)
 
+
 def cmd_resize(args):
     """Resize VM resources (CPUs, RAM, or disk)."""
     if not vm_exists(args.name):
@@ -889,73 +890,53 @@ def cmd_resize(args):
     vm_path = vm_dir(args.name)
     disk_path = os.path.join(vm_path, f"{args.name}.qcow2")
 
+    needs_shutdown = (args.cpus is not None or args.ram is not None) and state == "running"
+
+    # Shut down once if CPU or RAM changes require it
+    if needs_shutdown:
+        print("Note: CPU/RAM resize requires VM shutdown. Stopping VM...")
+        virsh(f"shutdown {args.name}")
+        for _ in range(30):
+            if vm_state(args.name) == "shut off":
+                break
+            time.sleep(1)
+
     # Handle CPU resize
     if args.cpus is not None:
         vcpus = resolve_resource(args.cpus, host_cpus())
         print(f"Resizing CPUs to {vcpus}...")
-        
-        # Set maximum vCPUs (requires VM to be shut off)
-        if state == "running":
-            print("Note: Setting maximum vCPUs requires VM shutdown. Stopping VM...")
-            virsh(f"shutdown {args.name}")
-            # Wait for shutdown
-            for _ in range(30):
-                if vm_state(args.name) == "shut off":
-                    break
-                time.sleep(1)
-        
         virsh(f"setvcpus {args.name} {vcpus} --maximum --config")
         virsh(f"setvcpus {args.name} {vcpus} --config")
         meta["vcpus"] = vcpus
         print(f"✓ CPUs updated to {vcpus}")
-        
-        if state == "running":
-            print("Restarting VM...")
-            virsh(f"start {args.name}")
 
     # Handle RAM resize
     if args.ram is not None:
         ram_mb = resolve_resource(args.ram, host_ram_mb())
         ram_kb = ram_mb * 1024
         print(f"Resizing RAM to {ram_mb}MB...")
-        
-        if state == "running":
-            print("Note: RAM resize requires VM shutdown. Stopping VM...")
-            virsh(f"shutdown {args.name}")
-            # Wait for shutdown
-            for _ in range(30):
-                if vm_state(args.name) == "shut off":
-                    break
-                time.sleep(1)
-        
         virsh(f"setmaxmem {args.name} {ram_kb} --config")
         virsh(f"setmem {args.name} {ram_kb} --config")
         meta["ram_mb"] = ram_mb
         print(f"✓ RAM updated to {ram_mb}MB")
-        
-        if state == "running":
-            print("Restarting VM...")
-            virsh(f"start {args.name}")
 
     # Handle disk resize
     if args.disk is not None:
         disk_gb = resolve_resource(args.disk, host_disk_gb())
         current_disk = meta.get("disk_gb", 0)
-        
+
         if disk_gb <= current_disk:
             print(f"Error: New disk size ({disk_gb}GB) must be larger than current size ({current_disk}GB)", file=sys.stderr)
             print("Disk shrinking is not supported.", file=sys.stderr)
             sys.exit(1)
-        
+
         print(f"Expanding disk from {current_disk}GB to {disk_gb}GB...")
-        
-        # Resize the qcow2 image
         run(f"qemu-img resize {disk_path} {disk_gb}G")
-        
-        # If VM is running, use virsh blockresize
-        if state == "running":
+
+        # If VM is still running (disk-only resize), use blockresize
+        if vm_state(args.name) == "running":
             virsh(f"blockresize {args.name} {disk_path} {disk_gb}G")
-        
+
         meta["disk_gb"] = disk_gb
         print(f"✓ Disk expanded to {disk_gb}GB")
         print("Note: You may need to resize the filesystem inside the VM:")
@@ -969,12 +950,18 @@ def cmd_resize(args):
     if args.cpus is not None or args.ram is not None:
         apply_resource_limits(args.name, meta["vcpus"], meta["ram_mb"])
         print(f"✓ Resource limits updated (CPU hard cap: {meta['vcpus']} cores, RAM limit: {meta['ram_mb']}MB)")
-    
+
+    # Restart once at the end if we shut it down
+    if needs_shutdown:
+        print("Restarting VM...")
+        virsh(f"start {args.name}")
+
     print(f"\n✓ VM '{args.name}' resized successfully!")
-    if state == "running" and (args.cpus is not None or args.ram is not None):
+    if needs_shutdown:
         print(f"VM state: running")
     elif state == "shut off":
         print(f"VM state: shut off (use 'nox start {args.name}' to start)")
+
 
 
 def cmd_backup(args):
