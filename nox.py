@@ -103,12 +103,11 @@ def resolve_resource(value, host_total):
     return int(v)
 
 
+
 def apply_resource_limits(name, vcpus, ram_mb):
-    """Apply hard CPU, memory, and I/O limits to a VM via libvirt XML tuning.
+    """Apply hard CPU limits to a VM via libvirt cputune.
 
     CPU: Uses cputune period/quota to hard-cap CPU usage to allocated vCPUs.
-    Memory: Sets hard_limit in memtune so the VM process cannot exceed its allocation.
-    I/O: Sets disk throughput limits (works on any I/O scheduler).
     """
     # CPU hard limit: period=100ms, quota = vcpus * period
     # This means the VM can use at most `vcpus` worth of CPU time per period
@@ -121,26 +120,17 @@ def apply_resource_limits(name, vcpus, ram_mb):
         # VM might not be running, config-only is fine
         pass
 
-    # Memory hard limit: prevent VM process from using more than allocated + small buffer
-    # memtune hard_limit is in KiB
-    hard_limit_kb = (ram_mb + 64) * 1024  # allocated + 64MB overhead for qemu
-    try:
-        virsh(f"memtune {name} --hard-limit {hard_limit_kb} --config")
-        virsh(f"memtune {name} --hard-limit {hard_limit_kb} --live", check=False)
-    except RuntimeError:
-        pass
 
-def strip_blkiotune(name):
-    """Remove blkiotune weight from VM XML config (incompatible with some I/O schedulers)."""
+
+def strip_unsupported_tuning(name):
+    """Remove blkiotune and memtune from VM XML config (not supported on all hosts)."""
     result = virsh(f"dumpxml {name} --inactive", check=False)
     if result.returncode != 0:
         return
     xml = result.stdout if isinstance(result.stdout, str) else result.stdout.decode()
-    if "<blkiotune>" not in xml:
-        return
-    # Remove the entire blkiotune block
     import re
     cleaned = re.sub(r'\s*<blkiotune>.*?</blkiotune>', '', xml, flags=re.DOTALL)
+    cleaned = re.sub(r'\s*<memtune>.*?</memtune>', '', cleaned, flags=re.DOTALL)
     if cleaned != xml:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tmp:
             tmp.write(cleaned)
@@ -149,6 +139,7 @@ def strip_blkiotune(name):
             virsh(f"define {tmp_path}")
         finally:
             os.unlink(tmp_path)
+
 
 
 
@@ -685,7 +676,7 @@ def cmd_start(args):
     if not vm_exists(args.name):
         print(f"VM '{args.name}' does not exist.", file=sys.stderr)
         sys.exit(1)
-    strip_blkiotune(args.name)
+    strip_unsupported_tuning(args.name)
     virsh(f"start {args.name}")
     print(f"VM '{args.name}' started.")
 
@@ -973,7 +964,7 @@ def cmd_resize(args):
     # Restart once at the end if we shut it down
     if needs_shutdown:
         print("Restarting VM...")
-        strip_blkiotune(args.name)
+        strip_unsupported_tuning(args.name)
         virsh(f"start {args.name}")
 
     print(f"\n✓ VM '{args.name}' resized successfully!")
