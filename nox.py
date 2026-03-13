@@ -104,26 +104,43 @@ def resolve_resource(value, host_total):
 
 
 
-def apply_resource_limits(name, vcpus, ram_mb):
-    """Apply hard CPU limits to a VM via libvirt cputune.
 
-    CPU: Uses cputune period/quota to hard-cap CPU usage to allocated vCPUs.
+
+def apply_resource_limits(name, vcpus, ram_mb):
+    """Pin VM to all cores except core 0, which is reserved for the host.
+
+    This ensures the host (SSH, tunnels, etc) always has a dedicated core.
+    All VMs share cores 1+ and the kernel scheduler handles fairness between them.
+    Works on all kernels without cgroup support.
     """
-    # CPU hard limit: period=100ms, quota = vcpus * period
-    # This means the VM can use at most `vcpus` worth of CPU time per period
-    period = 100000  # 100ms in microseconds
-    quota = vcpus * period
+    total = host_cpus()
+    if total <= 1:
+        # Single core host, can't reserve anything
+        return
+
+    # All vCPUs pinned to cores 1 through N-1
+    vm_cores = f"1-{total - 1}" if total > 2 else "1"
+    for i in range(vcpus):
+        try:
+            virsh(f"vcpupin {name} {i} {vm_cores} --config")
+            virsh(f"vcpupin {name} {i} {vm_cores} --live", check=False)
+        except RuntimeError:
+            pass
+
+    # Pin qemu emulator threads to same cores
     try:
-        virsh(f"schedinfo {name} --set vcpu_period={period} --set vcpu_quota={quota} --config")
-        virsh(f"schedinfo {name} --set vcpu_period={period} --set vcpu_quota={quota} --live", check=False)
+        virsh(f"emulatorpin {name} {vm_cores} --config")
+        virsh(f"emulatorpin {name} {vm_cores} --live", check=False)
     except RuntimeError:
-        # VM might not be running, config-only is fine
         pass
 
 
 
+
+
+
 def strip_unsupported_tuning(name):
-    """Remove blkiotune and memtune from VM XML config (not supported on all hosts)."""
+    """Remove blkiotune, memtune, and cputune from VM XML config (not supported on all hosts)."""
     result = virsh(f"dumpxml {name} --inactive", check=False)
     if result.returncode != 0:
         return
@@ -131,6 +148,7 @@ def strip_unsupported_tuning(name):
     import re
     cleaned = re.sub(r'\s*<blkiotune>.*?</blkiotune>', '', xml, flags=re.DOTALL)
     cleaned = re.sub(r'\s*<memtune>.*?</memtune>', '', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'\s*<cputune>.*?</cputune>', '', cleaned, flags=re.DOTALL)
     if cleaned != xml:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tmp:
             tmp.write(cleaned)
@@ -139,6 +157,7 @@ def strip_unsupported_tuning(name):
             virsh(f"define {tmp_path}")
         finally:
             os.unlink(tmp_path)
+
 
 
 
