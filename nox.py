@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
-import tempfile
+import base64
 import secrets
 import string
 
@@ -31,20 +31,10 @@ VERSION = get_version()
 NOX_DIR = os.path.expanduser("~/.nox")
 VMS_DIR = os.path.join(NOX_DIR, "vms")
 IMAGES_DIR = os.path.join(NOX_DIR, "images")
-BACKUPS_DIR = os.path.join(NOX_DIR, "backups")
 CONFIG_FILE = os.path.join(NOX_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "defaults": {"os": "debian", "cpus": 1, "ram": 512, "disk": 5},
-    "env": {},
-    "s3": {
-        "enabled": False,
-        "endpoint": "",
-        "bucket": "",
-        "access_key": "",
-        "secret_key": "",
-        "region": "us-east-1"
-    }
 }
 
 # OS image URLs (cloud images with cloud-init support)
@@ -62,7 +52,6 @@ OS_IMAGES = {
 def ensure_dirs():
     os.makedirs(VMS_DIR, exist_ok=True)
     os.makedirs(IMAGES_DIR, exist_ok=True)
-    os.makedirs(BACKUPS_DIR, exist_ok=True)
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -70,10 +59,6 @@ def load_config():
             return json.load(f)
     return dict(DEFAULT_CONFIG)
 
-def save_config(cfg):
-    ensure_dirs()
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
 
 def host_arch():
     m = os.uname().machine
@@ -81,8 +66,6 @@ def host_arch():
         return "arm64"
     return "amd64"
 
-def host_cpus():
-    return os.cpu_count() or 1
 
 def host_ram_mb():
     with open("/proc/meminfo") as f:
@@ -96,136 +79,31 @@ def host_disk_gb(path="/"):
     return (st.f_frsize * st.f_blocks) // (1024 ** 3)
 
 def resolve_resource(value, host_total):
-    """If value <= 1.0, treat as fraction of host_total. Otherwise absolute."""
+    """Resolve a resource value. Only values strictly between 0 and 1 (exclusive)
+    are treated as fractions of host_total. Everything else is absolute."""
     v = float(value)
-    if v <= 1.0:
+    if 0 < v < 1:
         return max(1, int(math.ceil(v * host_total)))
-    return int(v)
+    return max(1, int(v))
 
-# ---------------------------------------------------------------------------
-# CPU Core Management
-# ---------------------------------------------------------------------------
-# Core 0 is always reserved for the host. The core map is rebuilt from
-# VM metadata on every lifecycle event (create/resize/delete/restore)
-# to keep pinning evenly distributed.
+def resolve_cpus(value):
+    """Resolve CPU value into (vcpus, cpu_quota_fraction).
 
+    Returns:
+        vcpus: number of virtual CPUs (always >= 1, ceil of value)
+        cpu_fraction: the raw float for quota calculation
 
-def rebuild_core_map():
-    """Rebuild the core map from all VM metadata and repin everything.
-    This is the single source of truth for CPU distribution.
-    Only counts VMs that exist in libvirt — stale directories are ignored."""
-    total = host_cpus()
-    if total <= 1:
-        return
-
-    available_cores = list(range(1, total))
-
-    # Collect only VMs that exist in libvirt
-    vms = []
-    if os.path.exists(VMS_DIR):
-        for vm_name in sorted(os.listdir(VMS_DIR)):
-            if not vm_exists(vm_name):
-                continue
-            meta = load_meta(vm_name)
-            if not meta:
-                continue
-            vms.append((vm_name, meta.get("vcpus", 1)))
-
-    if not vms:
-        return
-
-    # Sort by vCPU count descending — biggest VMs first for better spread
-    vms.sort(key=lambda x: x[1], reverse=True)
-
-    # Fresh load counter
-    load = {c: 0 for c in available_cores}
-
-    # Allocate and pin each VM
-    for vm_name, vcpus in vms:
-        cores = []
-        for _ in range(vcpus):
-            core = min(load, key=load.get)
-            cores.append(core)
-            load[core] += 1
-
-        # Apply pinning to libvirt
-        for i, core in enumerate(cores):
-            try:
-                virsh(f"vcpupin {vm_name} {i} {core} --config")
-                virsh(f"vcpupin {vm_name} {i} {core} --live", check=False)
-            except RuntimeError:
-                pass
-
-        unique = sorted(set(cores))
-        pin_str = ",".join(str(c) for c in unique)
-        try:
-            virsh(f"emulatorpin {vm_name} {pin_str} --config")
-            virsh(f"emulatorpin {vm_name} {pin_str} --live", check=False)
-        except RuntimeError:
-            pass
-
-        # Save pinning in VM metadata
-        meta = load_meta(vm_name)
-        if meta:
-            meta["pinned_cores"] = cores
-            save_meta(vm_name, meta)
-
-    # Print the map
-    print(f"Core allocation (core 0 reserved for host):")
-    for core in available_cores:
-        print(f"  Core {core}: {load[core]} vCPU(s)")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def strip_unsupported_tuning(name):
-    """Remove blkiotune, memtune, and cputune from VM XML config (not supported on all hosts)."""
-    result = virsh(f"dumpxml {name} --inactive", check=False)
-    if result.returncode != 0:
-        return
-    xml = result.stdout if isinstance(result.stdout, str) else result.stdout.decode()
-    import re
-    cleaned = re.sub(r'\s*<blkiotune>.*?</blkiotune>', '', xml, flags=re.DOTALL)
-    cleaned = re.sub(r'\s*<memtune>.*?</memtune>', '', cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r'\s*<cputune>.*?</cputune>', '', cleaned, flags=re.DOTALL)
-    if cleaned != xml:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tmp:
-            tmp.write(cleaned)
-            tmp_path = tmp.name
-        try:
-            virsh(f"define {tmp_path}")
-        finally:
-            os.unlink(tmp_path)
-
-
-
-
-
+    Examples:
+        0.5 → 1 vCPU, quota = 50% of 1 core
+        1   → 1 vCPU, quota = 100% of 1 core
+        1.5 → 2 vCPUs, quota = 150% total (1.5 cores)
+        2   → 2 vCPUs, quota = 200% total (2 cores)
+    """
+    v = float(value)
+    if v <= 0:
+        v = 1
+    vcpus = max(1, math.ceil(v))
+    return vcpus, v
 
 def run(cmd, check=True, capture=True):
     """Run a shell command."""
@@ -282,8 +160,7 @@ def vm_ip(name, timeout=60):
     while time.time() < deadline:
         result = virsh(f"domifaddr {name} --source agent", check=False)
         if result.returncode == 0:
-            stdout = result.stdout if isinstance(result.stdout, str) else result.stdout.decode('utf-8')
-            for line in stdout.splitlines():
+            for line in result.stdout.splitlines():
                 if "ipv4" in line.lower() and "127.0.0.1" not in line:
                     parts = line.split()
                     for part in parts:
@@ -293,240 +170,30 @@ def vm_ip(name, timeout=60):
         time.sleep(2)
 
     return None
+def apply_cpu_limit(name, cpu_fraction):
+    """Apply CPU cgroup limits so a VM cannot exceed its allocated CPU time.
+
+    cpu_fraction is the raw value from --cpus (e.g. 0.5, 1, 2).
+    quota = cpu_fraction * period gives exact CPU time limiting.
+    """
+    period = 100000  # 100ms default period
+    quota = max(1000, int(cpu_fraction * period))  # min 1ms to avoid zero
+    params = f"--set vcpu_quota={quota} --set vcpu_period={period} --set emulator_quota={quota} --set emulator_period={period} --set global_quota={quota} --set global_period={period}"
+
+    state = vm_state(name)
+    if state == "running":
+        # Apply to both live and config
+        virsh(f"schedinfo {name} {params} --config --live", check=False)
+    else:
+        # Config-only for stopped VMs
+        virsh(f"schedinfo {name} {params} --config", check=False)
+    print(f"✓ CPU limit applied: {cpu_fraction} CPU(s) max ({quota}/{period} quota/period)")
+
 
 def generate_password():
     """Generate random password."""
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(12))
-
-def list_networks():
-    """List available libvirt networks."""
-    try:
-        result = virsh("net-list --all", check=False)
-        if result.returncode != 0:
-            return []
-        
-        output = result.stdout
-        if isinstance(output, bytes):
-            output = output.decode('utf-8')
-        
-        networks = []
-        for line in output.splitlines()[2:]:  # Skip header lines
-            parts = line.split()
-            if len(parts) >= 3:
-                name = parts[0]
-                state = parts[1]
-                networks.append({'name': name, 'state': state, 'type': 'libvirt'})
-        return networks
-    except Exception as e:
-        print(f"Warning: Failed to list networks: {e}", file=sys.stderr)
-        return []
-
-
-# ---------------------------------------------------------------------------
-# S3 Helper Functions
-# ---------------------------------------------------------------------------
-
-def upload_to_s3(backup_path, backup_name, s3_config):
-    """Upload backup to S3-compatible storage."""
-    try:
-        print(f"\nUploading backup to S3...")
-        
-        endpoint = s3_config.get("endpoint")
-        bucket = s3_config.get("bucket")
-        access_key = s3_config.get("access_key")
-        secret_key = s3_config.get("secret_key")
-        region = s3_config.get("region", "us-east-1")
-        
-        # Create tarball of backup
-        import tarfile
-        tarball_path = f"{backup_path}.tar.gz"
-        with tarfile.open(tarball_path, "w:gz") as tar:
-            tar.add(backup_path, arcname=backup_name)
-        
-        # Upload using AWS CLI or boto3
-        s3_path = f"s3://{bucket}/nox-backups/{backup_name}.tar.gz"
-        
-        # Try using aws cli first
-        env = os.environ.copy()
-        env["AWS_ACCESS_KEY_ID"] = access_key
-        env["AWS_SECRET_ACCESS_KEY"] = secret_key
-        env["AWS_DEFAULT_REGION"] = region
-        
-        if endpoint:
-            env["AWS_ENDPOINT_URL"] = endpoint
-            cmd = f"aws s3 cp {tarball_path} {s3_path} --endpoint-url {endpoint}"
-        else:
-            cmd = f"aws s3 cp {tarball_path} {s3_path}"
-        
-        result = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True)
-        
-        # Clean up tarball
-        os.remove(tarball_path)
-        
-        if result.returncode == 0:
-            print(f"✓ Backup uploaded to S3: {s3_path}")
-        else:
-            print(f"Warning: Failed to upload to S3: {result.stderr}", file=sys.stderr)
-            
-    except Exception as e:
-        print(f"Warning: S3 upload failed: {e}", file=sys.stderr)
-
-def list_s3_backups(s3_config):
-    """List backups from S3."""
-    try:
-        endpoint = s3_config.get("endpoint")
-        bucket = s3_config.get("bucket")
-        access_key = s3_config.get("access_key")
-        secret_key = s3_config.get("secret_key")
-        region = s3_config.get("region", "us-east-1")
-        
-        env = os.environ.copy()
-        env["AWS_ACCESS_KEY_ID"] = access_key
-        env["AWS_SECRET_ACCESS_KEY"] = secret_key
-        env["AWS_DEFAULT_REGION"] = region
-        
-        s3_path = f"s3://{bucket}/nox-backups/"
-        
-        if endpoint:
-            env["AWS_ENDPOINT_URL"] = endpoint
-            cmd = f"aws s3 ls {s3_path} --endpoint-url {endpoint}"
-        else:
-            cmd = f"aws s3 ls {s3_path}"
-        
-        result = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            backups = []
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 4 and parts[-1].endswith('.tar.gz'):
-                    backup_name = parts[-1].replace('.tar.gz', '')
-                    date_str = f"{parts[0]} {parts[1]}"
-                    size = parts[2]
-                    backups.append({
-                        'name': backup_name,
-                        'date': date_str,
-                        'size': size,
-                        'source': 's3'
-                    })
-            return backups
-        else:
-            return []
-            
-    except Exception as e:
-        print(f"Warning: Failed to list S3 backups: {e}", file=sys.stderr)
-        return []
-
-def download_from_s3(backup_name, s3_config):
-    """Download backup from S3."""
-    try:
-        print(f"Downloading backup from S3...")
-        
-        endpoint = s3_config.get("endpoint")
-        bucket = s3_config.get("bucket")
-        access_key = s3_config.get("access_key")
-        secret_key = s3_config.get("secret_key")
-        region = s3_config.get("region", "us-east-1")
-        
-        env = os.environ.copy()
-        env["AWS_ACCESS_KEY_ID"] = access_key
-        env["AWS_SECRET_ACCESS_KEY"] = secret_key
-        env["AWS_DEFAULT_REGION"] = region
-        
-        s3_path = f"s3://{bucket}/nox-backups/{backup_name}.tar.gz"
-        tarball_path = os.path.join(BACKUPS_DIR, f"{backup_name}.tar.gz")
-        
-        if endpoint:
-            env["AWS_ENDPOINT_URL"] = endpoint
-            cmd = f"aws s3 cp {s3_path} {tarball_path} --endpoint-url {endpoint}"
-        else:
-            cmd = f"aws s3 cp {s3_path} {tarball_path}"
-        
-        result = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            # Extract tarball
-            import tarfile
-            with tarfile.open(tarball_path, "r:gz") as tar:
-                tar.extractall(BACKUPS_DIR)
-            
-            # Clean up tarball
-            os.remove(tarball_path)
-            
-            print(f"✓ Backup downloaded from S3")
-            return True
-        else:
-            print(f"Error: Failed to download from S3: {result.stderr}", file=sys.stderr)
-            return False
-            
-    except Exception as e:
-        print(f"Error: S3 download failed: {e}", file=sys.stderr)
-        return False
-
-def interactive_backup_selection(backups):
-    """Interactive backup selection using arrow keys."""
-    if not backups:
-        print("No backups available.")
-        return None
-    
-    try:
-        import curses
-        
-        def select_backup(stdscr):
-            curses.curs_set(0)
-            current_idx = 0
-            
-            while True:
-                stdscr.clear()
-                h, w = stdscr.getmaxyx()
-                
-                stdscr.addstr(0, 0, "Select a backup to restore (↑/↓ to navigate, Enter to select, q to quit):", curses.A_BOLD)
-                stdscr.addstr(1, 0, "-" * min(w-1, 80))
-                
-                for idx, backup in enumerate(backups):
-                    y = idx + 3
-                    if y >= h - 1:
-                        break
-                    
-                    source_tag = "[S3]" if backup.get('source') == 's3' else "[Local]"
-                    line = f"{source_tag} {backup['name']} - {backup.get('date', 'N/A')}"
-                    
-                    if idx == current_idx:
-                        stdscr.addstr(y, 0, f"> {line}", curses.A_REVERSE)
-                    else:
-                        stdscr.addstr(y, 0, f"  {line}")
-                
-                stdscr.refresh()
-                
-                key = stdscr.getch()
-                
-                if key == curses.KEY_UP and current_idx > 0:
-                    current_idx -= 1
-                elif key == curses.KEY_DOWN and current_idx < len(backups) - 1:
-                    current_idx += 1
-                elif key == ord('\n'):
-                    return backups[current_idx]
-                elif key == ord('q') or key == ord('Q'):
-                    return None
-        
-        return curses.wrapper(select_backup)
-        
-    except ImportError:
-        # Fallback to simple numbered selection if curses not available
-        print("\nAvailable backups:")
-        for idx, backup in enumerate(backups):
-            source_tag = "[S3]" if backup.get('source') == 's3' else "[Local]"
-            print(f"{idx + 1}. {source_tag} {backup['name']} - {backup.get('date', 'N/A')}")
-        
-        try:
-            choice = int(input("\nEnter backup number (0 to cancel): "))
-            if choice > 0 and choice <= len(backups):
-                return backups[choice - 1]
-        except (ValueError, KeyboardInterrupt):
-            pass
-        
-        return None
 
 # ---------------------------------------------------------------------------
 # Cloud-init generation
@@ -599,7 +266,7 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     disk = disk if disk is not None else defaults.get("disk", 5)
 
     arch = host_arch()
-    vcpus = resolve_resource(cpus, host_cpus())
+    vcpus, cpu_fraction = resolve_cpus(cpus)
     ram_mb = resolve_resource(ram, host_ram_mb())
     disk_gb = resolve_resource(disk, host_disk_gb())
 
@@ -693,21 +360,22 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     if autostart:
         virsh(f"autostart {name}")
 
+    # Apply CPU cgroup limits to enforce vCPU allocation
+    apply_cpu_limit(name, cpu_fraction)
+
     # Save metadata
     meta = {
         "name": name,
         "os": os_name,
         "arch": arch,
         "vcpus": vcpus,
+        "cpu_fraction": cpu_fraction,
         "ram_mb": ram_mb,
         "disk_gb": disk_gb,
         "autostart": autostart,
         "network": network,
     }
     save_meta(name, meta)
-
-    # Rebuild CPU core map across all VMs (core 0 reserved for host)
-    rebuild_core_map()
 
     if not start:
         print(f"VM '{name}' created (not started).")
@@ -753,21 +421,17 @@ def cmd_create(args):
         print(f"\nIMPORTANT: Save this password - it won't be shown again!")
         print(f"{'='*60}")
 
-
-
 def cmd_start(args):
     if not vm_exists(args.name):
         print(f"VM '{args.name}' does not exist.", file=sys.stderr)
         sys.exit(1)
-    state = vm_state(args.name)
-    if state == "running":
-        print(f"VM '{args.name}' is already running.")
-        return
-    strip_unsupported_tuning(args.name)
     virsh(f"start {args.name}")
+    # Re-apply CPU limits on start (live)
+    meta = load_meta(args.name)
+    if meta:
+        cpu_fraction = meta.get("cpu_fraction", meta.get("vcpus", 1))
+        apply_cpu_limit(args.name, cpu_fraction)
     print(f"VM '{args.name}' started.")
-
-
 
 def cmd_stop(args):
     if not vm_exists(args.name):
@@ -782,7 +446,6 @@ def cmd_restart(args):
         sys.exit(1)
     virsh(f"reboot {args.name}")
     print(f"VM '{args.name}' restarted.")
-
 
 def cmd_delete(args):
     if not vm_exists(args.name):
@@ -803,10 +466,6 @@ def cmd_delete(args):
     if os.path.exists(d):
         shutil.rmtree(d)
     print(f"VM '{args.name}' deleted.")
-
-    # Rebuild core map now that this VM is gone
-    rebuild_core_map()
-
 
 def cmd_list(args):
     result = virsh("list --all", check=False)
@@ -930,7 +589,6 @@ def cmd_passwd(args):
     new_password = generate_password()
 
     # Change password via qemu guest agent (works without network)
-    import json, base64
     pw_b64 = base64.b64encode(f"nox:{new_password}".encode()).decode()
     cmd_str = f"echo $(echo {pw_b64} | base64 -d) | chpasswd"
     ga_cmd = json.dumps({
@@ -944,21 +602,18 @@ def cmd_passwd(args):
 
     try:
         result = virsh(f"qemu-agent-command {args.name} '{ga_cmd}'")
-        stdout = result.stdout if isinstance(result.stdout, str) else result.stdout.decode()
-        data = json.loads(stdout)
+        data = json.loads(result.stdout)
         pid = data.get("return", {}).get("pid")
 
         if pid is None:
             raise RuntimeError("guest-exec returned no pid")
 
         # Wait for command to finish
-        import time
         for _ in range(10):
             time.sleep(1)
             status_cmd = json.dumps({"execute": "guest-exec-status", "arguments": {"pid": pid}})
             res2 = virsh(f"qemu-agent-command {args.name} '{status_cmd}'")
-            out2 = res2.stdout if isinstance(res2.stdout, str) else res2.stdout.decode()
-            status = json.loads(out2).get("return", {})
+            status = json.loads(res2.stdout).get("return", {})
             if status.get("exited"):
                 if status.get("exitcode", 0) != 0:
                     err = base64.b64decode(status.get("err-data", "")).decode()
@@ -1006,12 +661,13 @@ def cmd_resize(args):
 
     # Handle CPU resize
     if args.cpus is not None:
-        vcpus = resolve_resource(args.cpus, host_cpus())
-        print(f"Resizing CPUs to {vcpus}...")
+        vcpus, cpu_fraction = resolve_cpus(args.cpus)
+        print(f"Resizing CPUs to {vcpus} vCPU(s) (limit: {cpu_fraction} cores)...")
         virsh(f"setvcpus {args.name} {vcpus} --maximum --config")
         virsh(f"setvcpus {args.name} {vcpus} --config")
         meta["vcpus"] = vcpus
-        print(f"✓ CPUs updated to {vcpus}")
+        meta["cpu_fraction"] = cpu_fraction
+        print(f"✓ CPUs updated to {vcpus} vCPU(s)")
 
     # Handle RAM resize
     if args.ram is not None:
@@ -1036,7 +692,6 @@ def cmd_resize(args):
         print(f"Expanding disk from {current_disk}GB to {disk_gb}GB...")
         run(f"qemu-img resize {disk_path} {disk_gb}G")
 
-        # If VM is still running (disk-only resize), use blockresize
         if vm_state(args.name) == "running":
             virsh(f"blockresize {args.name} {disk_path} {disk_gb}G")
 
@@ -1049,15 +704,14 @@ def cmd_resize(args):
     # Save updated metadata
     save_meta(args.name, meta)
 
-    # Rebuild CPU core map after resize
-    if args.cpus is not None or args.ram is not None:
-        rebuild_core_map()
-
     # Restart once at the end if we shut it down
     if needs_shutdown:
         print("Restarting VM...")
-        strip_unsupported_tuning(args.name)
         virsh(f"start {args.name}")
+
+    # Re-apply CPU limits after resize
+    if args.cpus is not None:
+        apply_cpu_limit(args.name, meta["cpu_fraction"])
 
     print(f"\n✓ VM '{args.name}' resized successfully!")
     if needs_shutdown:
@@ -1065,340 +719,6 @@ def cmd_resize(args):
     elif state == "shut off":
         print(f"VM state: shut off (use 'nox start {args.name}' to start)")
 
-
-
-def cmd_backup(args):
-    """Backup a VM using live snapshot (no downtime)."""
-    if not vm_exists(args.name):
-        print(f"VM '{args.name}' does not exist.", file=sys.stderr)
-        sys.exit(1)
-
-    state = vm_state(args.name)
-    was_running = state == "running"
-    
-    # Create backup directory
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_name = f"{args.name}_{timestamp}"
-    backup_path = os.path.join(BACKUPS_DIR, backup_name)
-    os.makedirs(backup_path, exist_ok=True)
-
-    print(f"Creating live backup '{backup_name}'...")
-
-    vm_path = vm_dir(args.name)
-    disk_path = os.path.join(vm_path, f"{args.name}.qcow2")
-    snapshot_disk = os.path.join(vm_path, f"{args.name}_snapshot.qcow2")
-
-    try:
-        # Create external snapshot if VM is running (live backup)
-        if was_running:
-            print("Creating live snapshot (VM continues running)...")
-            # Create external snapshot - VM writes to new file, original becomes read-only
-            virsh(f"snapshot-create-as {args.name} backup_snapshot --disk-only --atomic --no-metadata")
-            # Now the original disk is frozen and can be safely backed up
-            time.sleep(1)  # Brief pause to ensure snapshot is ready
-
-        # Backup disk image with compression
-        print("Backing up disk image (compressed)...")
-        backup_disk = os.path.join(backup_path, f"{args.name}.qcow2")
-        run(f"qemu-img convert -O qcow2 -c {disk_path} {backup_disk}")
-
-        # If we created a snapshot, merge it back
-        if was_running:
-            print("Merging snapshot back...")
-            # Commit changes from snapshot back to original
-            virsh(f"blockcommit {args.name} vda --active --pivot")
-            # Clean up snapshot file
-            if os.path.exists(snapshot_disk):
-                os.remove(snapshot_disk)
-
-        # Backup metadata
-        meta = load_meta(args.name)
-        if meta:
-            backup_meta = os.path.join(backup_path, "meta.json")
-            with open(backup_meta, "w") as f:
-                json.dump(meta, f, indent=2)
-
-        # Backup cloud-init files if they exist
-        for filename in ["user-data", "meta-data", "cloud-init.iso"]:
-            src = os.path.join(vm_path, filename)
-            if os.path.exists(src):
-                dst = os.path.join(backup_path, filename)
-                shutil.copy2(src, dst)
-
-        # Get VM XML definition
-        result = virsh(f"dumpxml {args.name}")
-        xml_path = os.path.join(backup_path, "domain.xml")
-        xml_content = result.stdout if isinstance(result.stdout, str) else result.stdout.decode('utf-8')
-        with open(xml_path, "w") as f:
-            f.write(xml_content)
-
-        # Create backup info file
-        backup_info = {
-            "vm_name": args.name,
-            "backup_name": backup_name,
-            "timestamp": timestamp,
-            "was_running": was_running,
-            "metadata": meta,
-        }
-        info_path = os.path.join(backup_path, "backup_info.json")
-        with open(info_path, "w") as f:
-            json.dump(backup_info, f, indent=2)
-
-        print(f"✓ Backup created successfully: {backup_name}")
-        print(f"  Location: {backup_path}")
-        if was_running:
-            print(f"  VM '{args.name}' remained running during backup")
-
-        # Upload to S3 if configured
-        cfg = load_config()
-        s3_config = cfg.get("s3", {})
-        if s3_config.get("enabled"):
-            upload_to_s3(backup_path, backup_name, s3_config)
-
-    except Exception as e:
-        print(f"Error creating backup: {e}", file=sys.stderr)
-        # Try to clean up snapshot if it exists
-        if was_running:
-            try:
-                virsh(f"blockcommit {args.name} vda --active --pivot", check=False)
-                if os.path.exists(snapshot_disk):
-                    os.remove(snapshot_disk)
-            except:
-                pass
-        shutil.rmtree(backup_path, ignore_errors=True)
-        sys.exit(1)
-
-def cmd_restore(args):
-    """Restore a VM from backup with interactive selection."""
-    cfg = load_config()
-    s3_config = cfg.get("s3", {})
-    
-    # If no backup name provided, show interactive selection
-    if not args.backup_name:
-        # Collect local backups
-        local_backups = []
-        if os.path.exists(BACKUPS_DIR):
-            for backup_name in os.listdir(BACKUPS_DIR):
-                backup_path = os.path.join(BACKUPS_DIR, backup_name)
-                if not os.path.isdir(backup_path):
-                    continue
-                
-                info_path = os.path.join(backup_path, "backup_info.json")
-                if os.path.exists(info_path):
-                    with open(info_path) as f:
-                        info = json.load(f)
-                    local_backups.append({
-                        'name': backup_name,
-                        'date': info.get('timestamp', 'N/A'),
-                        'source': 'local'
-                    })
-        
-        # Collect S3 backups if enabled
-        s3_backups = []
-        if s3_config.get("enabled"):
-            s3_backups = list_s3_backups(s3_config)
-        
-        # Combine all backups
-        all_backups = local_backups + s3_backups
-        
-        if not all_backups:
-            print("No backups available.")
-            sys.exit(1)
-        
-        # Interactive selection
-        selected = interactive_backup_selection(all_backups)
-        
-        if not selected:
-            print("Restore cancelled.")
-            sys.exit(0)
-        
-        backup_name = selected['name']
-        
-        # Download from S3 if needed
-        if selected.get('source') == 's3':
-            backup_path = os.path.join(BACKUPS_DIR, backup_name)
-            if not os.path.exists(backup_path):
-                if not download_from_s3(backup_name, s3_config):
-                    sys.exit(1)
-    else:
-        backup_name = args.backup_name
-    
-    backup_path = os.path.join(BACKUPS_DIR, backup_name)
-    
-    if not os.path.exists(backup_path):
-        print(f"Backup '{backup_name}' does not exist.", file=sys.stderr)
-        sys.exit(1)
-
-    # Load backup info
-    info_path = os.path.join(backup_path, "backup_info.json")
-    if not os.path.exists(info_path):
-        print(f"Invalid backup: missing backup_info.json", file=sys.stderr)
-        sys.exit(1)
-
-    with open(info_path) as f:
-        backup_info = json.load(f)
-
-    original_name = backup_info["vm_name"]
-    restore_name = args.name if args.name else original_name
-
-    # Check if VM already exists
-    if vm_exists(restore_name):
-        if not args.force:
-            print(f"VM '{restore_name}' already exists. Use --force to overwrite.", file=sys.stderr)
-            sys.exit(1)
-        
-        print(f"Deleting existing VM '{restore_name}'...")
-        state = vm_state(restore_name)
-        if state == "running":
-            virsh(f"destroy {restore_name}")
-        virsh(f"undefine {restore_name} --nvram --remove-all-storage", check=False)
-
-    print(f"Restoring VM '{restore_name}' from backup '{backup_name}'...")
-
-    # Create VM directory
-    vm_path = vm_dir(restore_name)
-    os.makedirs(vm_path, exist_ok=True)
-
-    try:
-        # Restore disk image
-        print("Restoring disk image...")
-        backup_disk = os.path.join(backup_path, f"{original_name}.qcow2")
-        restore_disk = os.path.join(vm_path, f"{restore_name}.qcow2")
-        run(f"qemu-img convert -O qcow2 {backup_disk} {restore_disk}")
-
-        # Restore metadata
-        backup_meta = os.path.join(backup_path, "meta.json")
-        if os.path.exists(backup_meta):
-            with open(backup_meta) as f:
-                meta = json.load(f)
-            meta["name"] = restore_name
-            save_meta(restore_name, meta)
-
-        # Restore cloud-init files
-        for filename in ["user-data", "meta-data", "cloud-init.iso"]:
-            src = os.path.join(backup_path, filename)
-            if os.path.exists(src):
-                dst = os.path.join(vm_path, filename)
-                shutil.copy2(src, dst)
-
-        # Restore VM from XML
-        xml_path = os.path.join(backup_path, "domain.xml")
-        if os.path.exists(xml_path):
-            # Read and modify XML to update VM name and paths
-            with open(xml_path) as f:
-                xml_content = f.read()
-            
-            # Replace VM name and disk paths
-            xml_content = xml_content.replace(f"<name>{original_name}</name>", f"<name>{restore_name}</name>")
-            xml_content = xml_content.replace(f"{original_name}.qcow2", f"{restore_name}.qcow2")
-            
-            # Write modified XML to temp file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tmp:
-                tmp.write(xml_content)
-                tmp_xml = tmp.name
-            
-            try:
-                virsh(f"define {tmp_xml}")
-            finally:
-                os.unlink(tmp_xml)
-
-        print(f"✓ VM '{restore_name}' restored successfully!")
-        
-        # Rebuild CPU core map across all VMs
-        rebuild_core_map()
-
-        if backup_info.get("was_running") and not args.no_start:
-            print(f"Starting VM '{restore_name}'...")
-            virsh(f"start {restore_name}")
-        else:
-            print(f"VM '{restore_name}' is ready. Use 'nox start {restore_name}' to start it.")
-
-    except Exception as e:
-        print(f"Error restoring backup: {e}", file=sys.stderr)
-        shutil.rmtree(vm_path, ignore_errors=True)
-        sys.exit(1)
-
-def cmd_list_backups(args):
-    """List all backups from local and S3."""
-    cfg = load_config()
-    s3_config = cfg.get("s3", {})
-    
-    # Collect local backups
-    local_backups = []
-    if os.path.exists(BACKUPS_DIR):
-        for backup_name in os.listdir(BACKUPS_DIR):
-            backup_path = os.path.join(BACKUPS_DIR, backup_name)
-            if not os.path.isdir(backup_path):
-                continue
-
-            info_path = os.path.join(backup_path, "backup_info.json")
-            if os.path.exists(info_path):
-                with open(info_path) as f:
-                    info = json.load(f)
-                
-                # Calculate backup size
-                total_size = 0
-                for root, dirs, files in os.walk(backup_path):
-                    for f in files:
-                        fp = os.path.join(root, f)
-                        if os.path.exists(fp):
-                            total_size += os.path.getsize(fp)
-                
-                size_gb = total_size / (1024 ** 3)
-                
-                local_backups.append({
-                    'name': backup_name,
-                    'vm_name': info.get("vm_name", "?"),
-                    'timestamp': info.get("timestamp", "?"),
-                    'size': f"{size_gb:.2f}GB",
-                    'source': 'Local'
-                })
-    
-    # Collect S3 backups if enabled
-    s3_backups = []
-    if s3_config.get("enabled"):
-        print("Fetching S3 backups...")
-        s3_list = list_s3_backups(s3_config)
-        for backup in s3_list:
-            # Parse VM name from backup name (format: vmname_timestamp)
-            parts = backup['name'].rsplit('_', 2)
-            vm_name = parts[0] if len(parts) >= 3 else "?"
-            
-            s3_backups.append({
-                'name': backup['name'],
-                'vm_name': vm_name,
-                'timestamp': backup.get('date', '?'),
-                'size': backup.get('size', '?'),
-                'source': 'S3'
-            })
-    
-    all_backups = local_backups + s3_backups
-    
-    if not all_backups:
-        print("No backups found.")
-        return
-
-    print(f"{'SOURCE':<8} {'BACKUP NAME':<40} {'VM NAME':<20} {'DATE':<20} {'SIZE'}")
-    print("-" * 105)
-
-    for backup in sorted(all_backups, key=lambda x: x.get("timestamp", ""), reverse=True):
-        source = backup['source']
-        name = backup['name']
-        vm_name = backup['vm_name']
-        timestamp = backup['timestamp']
-        size = backup['size']
-        
-        # Format timestamp if needed
-        if timestamp != "?" and len(timestamp) == 15:  # Format: YYYYMMDD_HHMMSS
-            try:
-                dt = time.strptime(timestamp, "%Y%m%d_%H%M%S")
-                date_str = time.strftime("%Y-%m-%d %H:%M:%S", dt)
-            except:
-                date_str = timestamp
-        else:
-            date_str = timestamp
-
-        print(f"{source:<8} {name:<40} {vm_name:<20} {date_str:<20} {size}")
 
 def cmd_update(args):
     """Update nox to the latest version from GitHub."""
@@ -1501,20 +821,6 @@ def main():
     p.add_argument("--ram", type=float, default=None, help="New RAM in MB")
     p.add_argument("--disk", type=float, default=None, help="New disk size in GB (can only expand)")
 
-    # backup
-    p = sub.add_parser("backup", help="Backup a VM")
-    p.add_argument("name")
-
-    # restore
-    p = sub.add_parser("restore", help="Restore a VM from backup (interactive if no backup specified)")
-    p.add_argument("backup_name", nargs="?", default=None, help="Name of the backup to restore (optional - will show interactive selection)")
-    p.add_argument("--name", default=None, help="New name for restored VM (default: original name)")
-    p.add_argument("--force", action="store_true", help="Overwrite existing VM")
-    p.add_argument("--no-start", action="store_true", help="Don't start VM after restore")
-
-    # backups
-    sub.add_parser("backups", help="List all backups")
-
     # update
     sub.add_parser("update", aliases=["up"], help="Update nox")
 
@@ -1537,9 +843,6 @@ def main():
         "ssh": cmd_ssh,
         "passwd": cmd_passwd,
         "resize": cmd_resize,
-        "backup": cmd_backup,
-        "restore": cmd_restore,
-        "backups": cmd_list_backups,
         "update": cmd_update,
         "up": cmd_update,
     }
