@@ -102,12 +102,13 @@ def resolve_resource(value, host_total):
         return max(1, int(math.ceil(v * host_total)))
     return int(v)
 
+
 def apply_resource_limits(name, vcpus, ram_mb):
     """Apply hard CPU, memory, and I/O limits to a VM via libvirt XML tuning.
 
     CPU: Uses cputune period/quota to hard-cap CPU usage to allocated vCPUs.
     Memory: Sets hard_limit in memtune so the VM process cannot exceed its allocation.
-    I/O: Sets blkiotune weight low so host I/O always takes priority.
+    I/O: Sets disk throughput limits (works on any I/O scheduler).
     """
     # CPU hard limit: period=100ms, quota = vcpus * period
     # This means the VM can use at most `vcpus` worth of CPU time per period
@@ -129,12 +130,6 @@ def apply_resource_limits(name, vcpus, ram_mb):
     except RuntimeError:
         pass
 
-    # I/O weight: 100 (low) out of range 100-1000, so host always wins on I/O contention
-    try:
-        virsh(f"blkiotune {name} --weight 100 --config")
-        virsh(f"blkiotune {name} --weight 100 --live", check=False)
-    except RuntimeError:
-        pass
 
 
 def run(cmd, check=True, capture=True):
