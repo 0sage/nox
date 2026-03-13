@@ -106,33 +106,94 @@ def resolve_resource(value, host_total):
 
 
 
-def apply_resource_limits(name, vcpus, ram_mb):
-    """Pin VM to all cores except core 0, which is reserved for the host.
 
-    This ensures the host (SSH, tunnels, etc) always has a dedicated core.
-    All VMs share cores 1+ and the kernel scheduler handles fairness between them.
-    Works on all kernels without cgroup support.
+def get_core_load():
+    """Get current vCPU-to-core assignments across all VMs. Returns dict {core: count}.
+    Core 0 is reserved for the host and excluded."""
+    total = host_cpus()
+    # Initialize available cores (skip core 0)
+    load = {c: 0 for c in range(1, total)}
+
+    if not os.path.exists(VMS_DIR):
+        return load
+
+    for vm_name in os.listdir(VMS_DIR):
+        meta = load_meta(vm_name)
+        if not meta:
+            continue
+        pinned = meta.get("pinned_cores", [])
+        for core in pinned:
+            if core in load:
+                load[core] += 1
+
+    return load
+
+
+def allocate_cores(vcpus, exclude_vm=None):
+    """Allocate cores for a VM using least-loaded strategy.
+    Returns list of core IDs, one per vCPU. Cores can repeat (oversubscription)."""
+    total = host_cpus()
+    if total <= 1:
+        return [0]
+
+    # Get current load, excluding the VM being resized
+    load = {c: 0 for c in range(1, total)}
+    if os.path.exists(VMS_DIR):
+        for vm_name in os.listdir(VMS_DIR):
+            if vm_name == exclude_vm:
+                continue
+            meta = load_meta(vm_name)
+            if not meta:
+                continue
+            for core in meta.get("pinned_cores", []):
+                if core in load:
+                    load[core] += 1
+
+    # Assign each vCPU to the least-loaded core
+    assigned = []
+    for _ in range(vcpus):
+        core = min(load, key=load.get)
+        assigned.append(core)
+        load[core] += 1
+
+    return assigned
+
+
+def apply_resource_limits(name, vcpus, ram_mb):
+    """Pin VM vCPUs to specific host cores using least-loaded allocation.
+
+    Core 0 is always reserved for the host. Each vCPU is pinned to the
+    least-loaded available core, allowing oversubscription across VMs.
     """
     total = host_cpus()
     if total <= 1:
-        # Single core host, can't reserve anything
         return
 
-    # All vCPUs pinned to cores 1 through N-1
-    vm_cores = f"1-{total - 1}" if total > 2 else "1"
-    for i in range(vcpus):
+    cores = allocate_cores(vcpus, exclude_vm=name)
+
+    # Pin each vCPU to its assigned core
+    for i, core in enumerate(cores):
         try:
-            virsh(f"vcpupin {name} {i} {vm_cores} --config")
-            virsh(f"vcpupin {name} {i} {vm_cores} --live", check=False)
+            virsh(f"vcpupin {name} {i} {core} --config")
+            virsh(f"vcpupin {name} {i} {core} --live", check=False)
         except RuntimeError:
             pass
 
-    # Pin qemu emulator threads to same cores
+    # Pin emulator threads to all assigned cores (deduplicated)
+    unique_cores = sorted(set(cores))
+    pin_str = ",".join(str(c) for c in unique_cores)
     try:
-        virsh(f"emulatorpin {name} {vm_cores} --config")
-        virsh(f"emulatorpin {name} {vm_cores} --live", check=False)
+        virsh(f"emulatorpin {name} {pin_str} --config")
+        virsh(f"emulatorpin {name} {pin_str} --live", check=False)
     except RuntimeError:
         pass
+
+    # Save pinning in metadata for future allocation decisions
+    meta = load_meta(name)
+    if meta:
+        meta["pinned_cores"] = cores
+        save_meta(name, meta)
+
 
 
 
@@ -642,9 +703,11 @@ def create_vm(name, os_name=None, cpus=None, ram=None, disk=None,
     }
     save_meta(name, meta)
 
-    # Apply hard resource limits (CPU quota, memory cap, I/O weight)
+    # Apply CPU pinning (reserve core 0 for host)
     apply_resource_limits(name, vcpus, ram_mb)
-    print(f"✓ Resource limits applied (CPU hard cap: {vcpus} cores, RAM limit: {ram_mb}MB)")
+    meta = load_meta(name)
+    pins = meta.get("pinned_cores", []) if meta else []
+    print(f"✓ CPU pinned to cores {pins} (core 0 reserved for host)")
 
     if not start:
         print(f"VM '{name}' created (not started).")
@@ -975,10 +1038,12 @@ def cmd_resize(args):
     # Save updated metadata
     save_meta(args.name, meta)
 
-    # Re-apply hard resource limits after resize
+    # Re-apply CPU pinning after resize
     if args.cpus is not None or args.ram is not None:
         apply_resource_limits(args.name, meta["vcpus"], meta["ram_mb"])
-        print(f"✓ Resource limits updated (CPU hard cap: {meta['vcpus']} cores, RAM limit: {meta['ram_mb']}MB)")
+        updated_meta = load_meta(args.name)
+        pins = updated_meta.get("pinned_cores", []) if updated_meta else []
+        print(f"✓ CPU pinned to cores {pins} (core 0 reserved for host)")
 
     # Restart once at the end if we shut it down
     if needs_shutdown:
@@ -1231,10 +1296,10 @@ def cmd_restore(args):
 
         print(f"✓ VM '{restore_name}' restored successfully!")
         
-        # Apply resource limits to restored VM
+        # Apply CPU pinning to restored VM
         if meta:
             apply_resource_limits(restore_name, meta.get("vcpus", 1), meta.get("ram_mb", 512))
-            print(f"✓ Resource limits applied")
+            print(f"✓ CPU pinning applied")
 
         if backup_info.get("was_running") and not args.no_start:
             print(f"Starting VM '{restore_name}'...")
