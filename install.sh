@@ -195,12 +195,12 @@ enable_kvm() {
 configure_libvirt_network() {
     info "Configuring libvirt networks..."
 
-    if virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "default"; then
-        virsh --connect qemu:///system net-start default 2>/dev/null || true
-        virsh --connect qemu:///system net-autostart default 2>/dev/null || true
+    if $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "default"; then
+        $SUDO virsh --connect qemu:///system net-start default 2>/dev/null || true
+        $SUDO virsh --connect qemu:///system net-autostart default 2>/dev/null || true
     fi
 
-    if ! virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-net"; then
+    if ! $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-net"; then
         info "Creating nox-net network..."
 
         local bridge_num=1
@@ -213,7 +213,7 @@ configure_libvirt_network() {
             subnet_third=$((subnet_third + 1))
         done
 
-        virsh --connect qemu:///system net-define /dev/stdin <<EOF
+        $SUDO virsh --connect qemu:///system net-define /dev/stdin <<EOF
 <network>
   <name>nox-net</name>
   <forward mode='nat'/>
@@ -226,8 +226,8 @@ configure_libvirt_network() {
 </network>
 EOF
 
-        virsh --connect qemu:///system net-start nox-net 2>/dev/null || true
-        virsh --connect qemu:///system net-autostart nox-net 2>/dev/null || true
+        $SUDO virsh --connect qemu:///system net-start nox-net 2>/dev/null || true
+        $SUDO virsh --connect qemu:///system net-autostart nox-net 2>/dev/null || true
         info "✓ nox-net network created (192.168.${subnet_third}.0/24)"
     fi
 }
