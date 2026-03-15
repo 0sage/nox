@@ -439,7 +439,7 @@ run_full_verification() {
     fi
 
     # qemu:///system connection
-    if virsh --connect qemu:///system version >/dev/null 2>&1; then
+    if $SUDO virsh --connect qemu:///system version >/dev/null 2>&1; then
         check_pass "virsh qemu:///system connection: OK"
     else
         check_fail "virsh qemu:///system connection: FAILED — check libvirt permissions"
@@ -511,20 +511,20 @@ run_full_verification() {
     local has_active_network=false
 
     # nox-net (preferred)
-    if virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-net"; then
-        if virsh --connect qemu:///system net-info nox-net 2>/dev/null | grep -q "Active:.*yes"; then
+    if $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-net"; then
+        if $SUDO virsh --connect qemu:///system net-info nox-net 2>/dev/null | grep -q "Active:.*yes"; then
             check_pass "nox-net network: active"
             has_active_network=true
 
             # Check autostart
-            if virsh --connect qemu:///system net-info nox-net 2>/dev/null | grep -q "Autostart:.*yes"; then
+            if $SUDO virsh --connect qemu:///system net-info nox-net 2>/dev/null | grep -q "Autostart:.*yes"; then
                 check_pass "nox-net network: autostart enabled"
             else
                 check_warn "nox-net network: autostart disabled — enable with: virsh net-autostart nox-net"
             fi
 
             # Check DHCP range exists
-            local net_xml=$(virsh --connect qemu:///system net-dumpxml nox-net 2>/dev/null)
+            local net_xml=$($SUDO virsh --connect qemu:///system net-dumpxml nox-net 2>/dev/null)
             if echo "$net_xml" | grep -q "<range"; then
                 check_pass "nox-net network: DHCP range configured"
             else
@@ -532,7 +532,7 @@ run_full_verification() {
             fi
 
             # Check bridge interface exists
-            local nox_bridge=$(virsh --connect qemu:///system net-info nox-net 2>/dev/null | grep "Bridge:" | awk '{print $2}')
+            local nox_bridge=$($SUDO virsh --connect qemu:///system net-info nox-net 2>/dev/null | grep "Bridge:" | awk '{print $2}')
             if [ -n "$nox_bridge" ] && ip link show "$nox_bridge" >/dev/null 2>&1; then
                 check_pass "nox-net bridge interface: $nox_bridge (up)"
             else
@@ -546,8 +546,8 @@ run_full_verification() {
     fi
 
     # default network (fallback)
-    if virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "default"; then
-        if virsh --connect qemu:///system net-info default 2>/dev/null | grep -q "Active:.*yes"; then
+    if $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "default"; then
+        if $SUDO virsh --connect qemu:///system net-info default 2>/dev/null | grep -q "Active:.*yes"; then
             check_pass "default network: active"
             has_active_network=true
         else
@@ -816,14 +816,14 @@ run_full_verification() {
     # -----------------------------------------------------------------------
 
     # Test virsh can list VMs
-    if virsh --connect qemu:///system list --all >/dev/null 2>&1; then
+    if $SUDO virsh --connect qemu:///system list --all >/dev/null 2>&1; then
         check_pass "virsh list: works"
     else
         check_fail "virsh list: FAILED — cannot manage VMs"
     fi
 
     # Test virsh can list networks
-    if virsh --connect qemu:///system net-list --all >/dev/null 2>&1; then
+    if $SUDO virsh --connect qemu:///system net-list --all >/dev/null 2>&1; then
         check_pass "virsh net-list: works"
     else
         check_fail "virsh net-list: FAILED — cannot manage networks"
