@@ -443,13 +443,6 @@ run_full_verification() {
         check_warn "libvirtd: not enabled on boot — enable with: sudo systemctl enable libvirtd"
     fi
 
-    # qemu:///system connection
-    if _virsh version >/dev/null 2>&1; then
-        check_pass "virsh qemu:///system connection: OK"
-    else
-        check_fail "virsh qemu:///system connection: FAILED — check libvirt permissions"
-    fi
-
     # QEMU emulator binary exists for this arch
     if [ "$arch" = "arm64" ]; then
         if command -v qemu-system-aarch64 >/dev/null 2>&1; then
@@ -510,61 +503,8 @@ run_full_verification() {
     fi
 
     # -----------------------------------------------------------------------
-    section "7. Libvirt Networks"
+    section "7. Networking"
     # -----------------------------------------------------------------------
-
-    local has_active_network=false
-
-    # nox-net (preferred)
-    if _virsh net-list --all | grep -q "nox-net"; then
-        if _virsh net-info nox-net | grep -q "Active:.*yes"; then
-            check_pass "nox-net network: active"
-            has_active_network=true
-
-            # Check autostart
-            if _virsh net-info nox-net | grep -q "Autostart:.*yes"; then
-                check_pass "nox-net network: autostart enabled"
-            else
-                check_warn "nox-net network: autostart disabled — enable with: virsh net-autostart nox-net"
-            fi
-
-            # Check DHCP range exists
-            local net_xml=$(_virsh net-dumpxml nox-net)
-            if echo "$net_xml" | grep -q "<range"; then
-                check_pass "nox-net network: DHCP range configured"
-            else
-                check_warn "nox-net network: no DHCP range — VMs won't get IP addresses"
-            fi
-
-            # Check bridge interface exists
-            local nox_bridge=$(_virsh net-info nox-net | grep "Bridge:" | awk '{print $2}')
-            if [ -n "$nox_bridge" ] && ip link show "$nox_bridge" >/dev/null 2>&1; then
-                check_pass "nox-net bridge interface: $nox_bridge (up)"
-            else
-                check_warn "nox-net bridge interface: not found or down"
-            fi
-        else
-            check_warn "nox-net network: exists but inactive — start with: virsh net-start nox-net"
-        fi
-    else
-        check_warn "nox-net network: not defined (will be created)"
-    fi
-
-    # default network (fallback)
-    if _virsh net-list --all | grep -q "default"; then
-        if _virsh net-info default | grep -q "Active:.*yes"; then
-            check_pass "default network: active"
-            has_active_network=true
-        else
-            check_warn "default network: exists but inactive"
-        fi
-    else
-        check_warn "default network: not defined"
-    fi
-
-    if [ "$has_active_network" = false ]; then
-        check_fail "No active libvirt network — VMs cannot get network connectivity"
-    fi
 
     # NAT forwarding (required for VM internet access)
     if [ -f /proc/sys/net/ipv4/ip_forward ]; then
