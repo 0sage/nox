@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build binaries
+        run: |
+          bun build src/nox.ts --compile --target=bun-linux-x64 --outfile nox-linux-amd64
+          bun build src/nox.ts --compile --target=bun-linux-arm64 --outfile nox-linux-arm64
+
+      - name: Get version
+        id: version
+        run: echo "version=$(cat VERSION)" >> $GITHUB_OUTPUT
+
+      - name: Delete existing release
+        run: gh release delete latest --yes 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        run: |
+          gh release create latest \
+            --title "nox ${{ steps.version.outputs.version }}" \
+            --notes "Automated build from main branch" \
+            --latest \
+            nox-linux-amd64 \
+            nox-linux-arm64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

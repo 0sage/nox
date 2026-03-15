@@ -1,0 +1,12 @@
+{
+  "name": "nox",
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/nox.ts",
+    "build": "bun build src/nox.ts --compile --outfile nox"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
