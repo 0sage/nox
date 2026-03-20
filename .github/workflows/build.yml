@@ -15,6 +15,24 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      - name: Bump patch version
+        run: |
+          current=$(cat VERSION)
+          IFS='.' read -r major minor patch <<< "$current"
+          patch=$((patch + 1))
+          echo "$major.$minor.$patch" > VERSION
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add VERSION
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: bump version to $(cat VERSION) [skip ci]"
+          git push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build binaries
         run: |
           bun build src/nox.ts --compile --target=bun-linux-x64 --outfile nox-linux-amd64
