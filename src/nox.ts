@@ -549,6 +549,26 @@ async function cmdSsh(args: string[]) {
   }
 }
 
+async function cmdSerial(args: string[]) {
+  const name = args[0];
+  if (!name || !vmExists(name)) { console.error(`VM '${name}' does not exist.`); process.exit(1); }
+
+  const state = vmState(name);
+  if (state !== "running") {
+    console.error(`VM '${name}' is not running. Start it with: nox start ${name}`);
+    process.exit(1);
+  }
+
+  console.log(`Connecting to serial console of '${name}'... (use Ctrl+] to exit)`);
+  const proc = Bun.spawn(["virsh", "-c", "qemu:///system", "console", name], {
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const result = await proc.exited;
+  process.exit(result);
+}
+
 function cmdRun(args: string[]) {
   const name = args[0];
   const cmd = args.slice(1).join(" ");
@@ -1122,6 +1142,7 @@ Commands:
   status <name>          Show VM details
   stats <name>           Show CPU, RAM, disk usage & uptime
   ssh <name> [-- cmd]    SSH into VM
+  serial <name>          Connect to VM serial console
   run <name> <command>   Run a command inside VM via SSH
   passwd <name>          Change SSH password
   resize <name> [opts]   Resize VM resources
@@ -1173,6 +1194,7 @@ async function main() {
     case "status":   cmdStatus(rest); break;
     case "stats":    cmdStats(rest); break;
     case "ssh":      await cmdSsh(rest); break;
+    case "serial":   await cmdSerial(rest); break;
     case "run":      cmdRun(rest); break;
     case "passwd":   cmdPasswd(rest); break;
     case "resize":   cmdResize(rest); break;
