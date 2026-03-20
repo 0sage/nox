@@ -383,6 +383,7 @@ function cmdCreate(args: string[]) {
       ram: { type: "string", default: undefined },
       disk: { type: "string", default: undefined },
       network: { type: "string", default: undefined },
+      passwd: { type: "string", default: undefined },
       "no-autostart": { type: "boolean", default: false },
       "no-start": { type: "boolean", default: false },
     },
@@ -399,6 +400,7 @@ function cmdCreate(args: string[]) {
     ram: values.ram ? parseFloat(values.ram as string) : undefined,
     disk: values.disk ? parseFloat(values.disk as string) : undefined,
     network: values.network as string | undefined,
+    password: values.passwd as string | undefined,
     autostart: !values["no-autostart"],
     start: !values["no-start"],
   });
@@ -547,11 +549,121 @@ async function cmdSsh(args: string[]) {
   }
 }
 
+function cmdRun(args: string[]) {
+  const name = args[0];
+  const cmd = args.slice(1).join(" ");
+  if (!name || !cmd) { console.error("Usage: nox run <name> <command>"); process.exit(1); }
+  if (!vmExists(name)) { console.error(`VM '${name}' does not exist.`); process.exit(1); }
+
+  const state = vmState(name);
+  if (state !== "running") {
+    console.error(`VM '${name}' is not running. Start it with: nox start ${name}`);
+    process.exit(1);
+  }
+
+  ensureSshKey();
+
+  const ip = vmIp(name, 30);
+  if (!ip) {
+    console.error(`Failed to get IP address for VM '${name}'.`);
+    process.exit(1);
+  }
+
+  const sshOpts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"];
+  const proc = Bun.spawnSync(["ssh", ...sshOpts, `nox@${ip}`, cmd], {
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  process.exit(proc.exitCode);
+}
+
 function cmdStatus(args: string[]) {
   const name = args[0];
   if (!name || !vmExists(name)) { console.error(`VM '${name}' does not exist.`); process.exit(1); }
   const result = virsh(`dominfo ${name}`);
   console.log(result.stdout);
+}
+
+function cmdStats(args: string[]) {
+  const name = args[0];
+  if (!name || !vmExists(name)) { console.error(`VM '${name}' does not exist.`); process.exit(1); }
+
+  const state = vmState(name);
+  if (state !== "running") {
+    console.error(`VM '${name}' is not running.`);
+    process.exit(1);
+  }
+
+  const meta = loadMeta(name);
+
+  // CPU usage via domstats
+  const cpuStats = virsh(`domstats ${name} --cpu-total`, false);
+  let cpuTime = 0;
+  for (const line of cpuStats.stdout.split("\n")) {
+    const m = line.match(/cpu\.time=(\d+)/);
+    if (m) cpuTime = parseInt(m[1]);
+  }
+
+  // Memory usage
+  virsh(`dommemstat ${name} --period 1 --live`, false);
+  // small delay to let the stat collect
+  Bun.sleepSync(1500);
+  const memStats = virsh(`dommemstat ${name}`, false);
+  let memTotal = 0, memAvailable = 0, memUsed = 0;
+  for (const line of memStats.stdout.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts[0] === "actual") memTotal = parseInt(parts[1]) || 0;
+    if (parts[0] === "available") memAvailable = parseInt(parts[1]) || 0;
+    if (parts[0] === "unused") memUsed = memTotal - (parseInt(parts[1]) || 0);
+  }
+  if (!memUsed && memAvailable) memUsed = memTotal - memAvailable;
+
+  // Disk usage via domblkinfo
+  const blkList = virsh(`domblklist ${name}`, false);
+  let diskTotal = 0, diskUsed = 0;
+  for (const line of blkList.stdout.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts[1] && parts[1].endsWith(".qcow2")) {
+      const blkInfo = virsh(`domblkinfo ${name} ${parts[0]}`, false);
+      for (const bl of blkInfo.stdout.split("\n")) {
+        const m = bl.match(/^Capacity:\s+(\d+)/);
+        if (m) diskTotal = parseInt(m[1]);
+        const m2 = bl.match(/^Allocation:\s+(\d+)/);
+        if (m2) diskUsed = parseInt(m2[1]);
+      }
+    }
+  }
+
+  // Uptime via qemu-guest-agent
+  let uptime = "N/A";
+  const ip = vmIp(name, 5);
+  if (ip) {
+    const sshOpts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=5"];
+    const uptimeProc = Bun.spawnSync(["ssh", ...sshOpts, `nox@${ip}`, "uptime -p"], {
+      stdout: "pipe", stderr: "pipe",
+    });
+    if (uptimeProc.exitCode === 0) {
+      uptime = uptimeProc.stdout.toString().trim();
+    }
+  }
+
+  const fmtMb = (kb: number) => `${(kb / 1024).toFixed(0)} MB`;
+  const fmtGb = (bytes: number) => `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+
+  console.log(`\nVM '${name}' stats:`);
+  console.log(`${"=".repeat(40)}`);
+  console.log(`  CPU time:    ${(cpuTime / 1e9).toFixed(1)}s`);
+  console.log(`  RAM:         ${fmtMb(memUsed)} / ${fmtMb(memTotal)} used`);
+  console.log(`  Disk:        ${fmtGb(diskUsed)} / ${fmtGb(diskTotal)} used`);
+  console.log(`  Uptime:      ${uptime}`);
+  if (meta) {
+    console.log(`  vCPUs:       ${meta.vcpus ?? "N/A"}`);
+    console.log(`  OS:          ${meta.os ?? "N/A"}`);
+    console.log(`  Network:     ${meta.network ?? "N/A"}`);
+  }
+  if (ip) console.log(`  IP:          ${ip}`);
+  console.log(`${"=".repeat(40)}`);
 }
 
 function cmdPasswd(args: string[]) {
@@ -1008,7 +1120,9 @@ Commands:
   delete|rm <name>       Delete a VM
   list|ls                List all VMs
   status <name>          Show VM details
+  stats <name>           Show CPU, RAM, disk usage & uptime
   ssh <name> [-- cmd]    SSH into VM
+  run <name> <command>   Run a command inside VM via SSH
   passwd <name>          Change SSH password
   resize <name> [opts]   Resize VM resources
   update|up              Update nox
@@ -1020,6 +1134,7 @@ Create options:
   --ram N                RAM in MB, fractional or absolute (default: 512)
   --disk N               Disk size in GB (default: 5)
   --network NAME         Libvirt network (default: auto-detect)
+  --passwd PASSWORD       Set user password (default: auto-generated)
   --no-autostart         Disable autostart on boot
   --no-start             Create but don't start VM
 
@@ -1056,7 +1171,9 @@ async function main() {
     case "list":
     case "ls":       cmdList(); break;
     case "status":   cmdStatus(rest); break;
+    case "stats":    cmdStats(rest); break;
     case "ssh":      await cmdSsh(rest); break;
+    case "run":      cmdRun(rest); break;
     case "passwd":   cmdPasswd(rest); break;
     case "resize":   cmdResize(rest); break;
     case "update":
