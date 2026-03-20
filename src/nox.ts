@@ -136,24 +136,33 @@ function saveMeta(name: string, meta: Record<string, any>) {
 }
 
 function vmIp(name: string, timeout = 60): string | null {
+  const ips = vmIps(name, timeout);
+  // Prefer local network IPs, skip Tailscale (100.64.0.0/10) and other overlay ranges
+  const localIp = ips.find(ip => !ip.startsWith("100."));
+  return localIp ?? ips[0] ?? null;
+}
+
+function vmIps(name: string, timeout = 60): string[] {
   const deadline = Date.now() + timeout * 1000;
   while (Date.now() < deadline) {
     const result = virsh(`domifaddr ${name} --source agent`, false);
     if (result.exitCode === 0) {
+      const ips: string[] = [];
       for (const line of result.stdout.split("\n")) {
         if (line.toLowerCase().includes("ipv4") && !line.includes("127.0.0.1")) {
           const parts = line.trim().split(/\s+/);
           for (const part of parts) {
             if (part.includes("/") && !part.startsWith("127.")) {
-              return part.split("/")[0];
+              ips.push(part.split("/")[0]);
             }
           }
         }
       }
+      if (ips.length > 0) return ips;
     }
     Bun.sleepSync(2000);
   }
-  return null;
+  return [];
 }
 
 function applyCpuLimit(name: string, cpuFraction: number) {
@@ -495,7 +504,7 @@ function cmdList() {
     const ram = meta.ram_mb != null ? `${meta.ram_mb}MB` : "?";
     const disk = meta.disk_gb != null ? `${meta.disk_gb}GB` : "?";
     const auto = meta.autostart ? "yes" : "no";
-    const ip = state === "running" ? (vmIp(name, 1) ?? "") : "";
+    const ip = state === "running" ? vmIps(name, 1).join(", ") : "";
 
     console.log(
       `${name.padEnd(20)} ${state.padEnd(15)} ${os.padEnd(10)} ${String(vcpus).padEnd(6)} ${ram.padEnd(8)} ${disk.padEnd(8)} ${auto.padEnd(10)} ${ip}`
