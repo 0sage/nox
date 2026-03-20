@@ -1108,6 +1108,7 @@ function cmdUpdate() {
 
     console.log("Installing...");
     run(`sudo mkdir -p /usr/local/lib/nox`);
+    run(`sudo rm -f /usr/local/bin/nox`);
     run(`sudo cp ${tmpDir}/nox /usr/local/bin/nox`);
     run(`sudo chmod +x /usr/local/bin/nox`);
     run(`sudo cp ${tmpDir}/VERSION /usr/local/lib/nox/VERSION`);
