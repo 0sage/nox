@@ -441,7 +441,21 @@ function cmdCreate(args: string[]) {
 
   if (!values["no-start"]) {
     console.log("\nWaiting for VM to boot and get IP address...");
-    const ip = vmIp(name, 180);
+    const staticIp = values.ip as string | undefined;
+    let ip: string | null = null;
+
+    if (staticIp) {
+      // Wait for cloud-init to apply the static IP
+      const deadline = Date.now() + 180 * 1000;
+      while (Date.now() < deadline) {
+        const current = vmIp(name, 10);
+        if (current === staticIp) { ip = current; break; }
+        Bun.sleepSync(3000);
+      }
+      if (!ip) ip = vmIp(name, 5) ?? staticIp; // fallback: show static IP anyway
+    } else {
+      ip = vmIp(name, 180);
+    }
 
     console.log(`\n${"=".repeat(60)}`);
     console.log(`VM '${name}' is ready!`);
