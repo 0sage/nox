@@ -473,6 +473,15 @@ function cmdDelete(args: string[]) {
   }
 
   if (vmState(name) === "running") virsh(`destroy ${name}`);
+
+  const delMeta = loadMeta(name);
+  if (delMeta?.forwards?.length) {
+    const ip = vmIp(name, 5);
+    if (ip) {
+      for (const f of delMeta.forwards) iptablesForwardRemove(ip, f.host_port, f.vm_port, f.proto);
+    }
+  }
+
   virsh(`undefine ${name} --nvram --remove-all-storage`, false);
   const d = vmDir(name);
   if (existsSync(d)) rmSync(d, { recursive: true, force: true });
@@ -748,6 +757,84 @@ function cmdPasswd(args: string[]) {
   }
 }
 
+function iptablesSave() {
+  run("iptables-save > /etc/iptables/rules.v4", false);
+}
+
+function iptablesForwardAdd(vmIp: string, hostPort: number, vmPort: number, proto: string) {
+  run(`iptables -t nat -A PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`);
+  run(`iptables -A FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`);
+  iptablesSave();
+}
+
+function iptablesForwardRemove(vmIp: string, hostPort: number, vmPort: number, proto: string) {
+  run(`iptables -t nat -D PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`, false);
+  run(`iptables -D FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`, false);
+  iptablesSave();
+}
+
+function cmdForward(args: string[]) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: {
+      proto: { type: "string", default: "tcp" },
+      remove: { type: "boolean", default: false },
+      list: { type: "boolean", default: false },
+    },
+    allowPositionals: true,
+  });
+
+  const name = positionals[0];
+  if (!name || !vmExists(name)) { console.error(`VM '${name}' does not exist.`); process.exit(1); }
+
+  const meta = loadMeta(name) ?? {};
+  const forwards: Array<{ host_port: number; vm_port: number; proto: string }> = meta.forwards ?? [];
+
+  if (values.list) {
+    if (forwards.length === 0) { console.log(`No port forwards for '${name}'.`); return; }
+    console.log(`Port forwards for '${name}':`);
+    for (const f of forwards) console.log(`  ${f.proto.toUpperCase()}  host:${f.host_port} → vm:${f.vm_port}`);
+    return;
+  }
+
+  const mapping = positionals[1];
+  if (!mapping) { console.error("Usage: nox forward <name> <host_port>:<vm_port> [--proto tcp|udp] [--remove]"); process.exit(1); }
+
+  const [hostPortStr, vmPortStr] = mapping.split(":");
+  const hostPort = parseInt(hostPortStr);
+  const vmPort = parseInt(vmPortStr ?? hostPortStr);
+  const proto = (values.proto as string).toLowerCase();
+
+  if (isNaN(hostPort) || isNaN(vmPort)) { console.error("Invalid port mapping. Use format: 8080:80"); process.exit(1); }
+
+  if (values.remove) {
+    const ip = vmIp(name, 5);
+    if (ip) iptablesForwardRemove(ip, hostPort, vmPort, proto);
+    meta.forwards = forwards.filter(f => !(f.host_port === hostPort && f.vm_port === vmPort && f.proto === proto));
+    saveMeta(name, meta);
+    console.log(`✓ Removed forward ${proto.toUpperCase()} host:${hostPort} → vm:${vmPort}`);
+    return;
+  }
+
+  if (vmState(name) !== "running") { console.error(`VM '${name}' is not running.`); process.exit(1); }
+
+  const ip = vmIp(name, 30);
+  if (!ip) { console.error(`Could not get IP for VM '${name}'.`); process.exit(1); }
+
+  if (forwards.some(f => f.host_port === hostPort && f.proto === proto)) {
+    console.error(`Host port ${hostPort}/${proto} is already forwarded for this VM.`);
+    process.exit(1);
+  }
+
+  iptablesForwardAdd(ip, hostPort, vmPort, proto);
+  forwards.push({ host_port: hostPort, vm_port: vmPort, proto });
+  meta.forwards = forwards;
+  saveMeta(name, meta);
+
+  console.log(`✓ Forwarding host:${hostPort} → ${ip}:${vmPort} (${proto.toUpperCase()})`);
+  console.log(`  Access via: http://<host-ip>:${hostPort}`);
+}
+
 function cmdResize(args: string[]) {
   const { values, positionals } = parseArgs({
     args,
@@ -976,6 +1063,11 @@ function cmdDoctor() {
 
   if (!hasActiveNetwork) fail("No active libvirt network — VMs cannot get connectivity");
 
+  // iptables-persistent
+  const iptablesPersistent = run("test -d /etc/iptables", false);
+  if (iptablesPersistent.exitCode === 0) pass("iptables-persistent: installed");
+  else softWarn("iptables-persistent: NOT FOUND — port forwards won't survive reboots (apt install iptables-persistent)");
+
   // IP forwarding
   try {
     const ipFwd = readFileSync("/proc/sys/net/ipv4/ip_forward", "utf-8").trim();
@@ -1156,6 +1248,7 @@ Commands:
   run <name> <command>   Run a command inside VM via SSH
   passwd <name>          Change SSH password
   resize <name> [opts]   Resize VM resources
+  forward <name> <hp:vp> Forward host port to VM port
   update|up              Update nox
   doctor                 Run comprehensive system health checks
 
@@ -1172,7 +1265,12 @@ Create options:
 Resize options:
   --cpus N               New CPU count
   --ram N                New RAM in MB
-  --disk N               New disk size in GB (expand only)`);
+  --disk N               New disk size in GB (expand only)
+
+Forward options:
+  --proto tcp|udp        Protocol (default: tcp)
+  --remove               Remove the forward rule
+  --list                 List all forwards for a VM`);
 }
 
 async function main() {
@@ -1208,6 +1306,7 @@ async function main() {
     case "run":      cmdRun(rest); break;
     case "passwd":   cmdPasswd(rest); break;
     case "resize":   cmdResize(rest); break;
+    case "forward":  cmdForward(rest); break;
     case "update":
     case "up":       cmdUpdate(); break;
     case "doctor":   cmdDoctor(); break;

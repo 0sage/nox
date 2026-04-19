@@ -138,6 +138,7 @@ install_debian() {
         genisoimage \
         openssh-client \
         dnsmasq-base \
+        iptables-persistent \
         unzip \
         curl
 
@@ -534,6 +535,14 @@ run_full_verification() {
         else
             check_warn "NAT masquerade: not detected — VM internet may not work"
         fi
+    fi
+
+    # iptables-persistent (port forward persistence across reboots)
+    if command -v iptables-save >/dev/null 2>&1 && [ -d /etc/iptables ]; then
+        check_pass "iptables-persistent: installed"
+    else
+        check_warn "iptables-persistent: NOT FOUND — port forwards won't survive reboots"
+        check_warn "  Install with: sudo apt install iptables-persistent"
     fi
 
     # dnsmasq (DHCP for libvirt networks)
