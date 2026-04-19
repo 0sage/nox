@@ -758,18 +758,18 @@ function cmdPasswd(args: string[]) {
 }
 
 function iptablesSave() {
-  run("iptables-save > /etc/iptables/rules.v4", false);
+  run("/sbin/iptables-save > /etc/iptables/rules.v4", false);
 }
 
 function iptablesForwardAdd(vmIp: string, hostPort: number, vmPort: number, proto: string) {
-  run(`iptables -t nat -A PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`);
-  run(`iptables -A FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`);
+  run(`/sbin/iptables -t nat -A PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`);
+  run(`/sbin/iptables -A FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`);
   iptablesSave();
 }
 
 function iptablesForwardRemove(vmIp: string, hostPort: number, vmPort: number, proto: string) {
-  run(`iptables -t nat -D PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`, false);
-  run(`iptables -D FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`, false);
+  run(`/sbin/iptables -t nat -D PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`, false);
+  run(`/sbin/iptables -D FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`, false);
   iptablesSave();
 }
 
