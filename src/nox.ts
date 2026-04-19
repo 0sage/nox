@@ -229,16 +229,10 @@ function generateCloudInit(name: string, password: string, osName = "debian", st
   - mkdir -p /etc/network/interfaces.d
   - |
     GW=$(ip route show default | awk '/default/ {print $3}')
-    cat > /etc/network/interfaces.d/enp1s0 <<EOF
-    auto enp1s0
-    iface enp1s0 inet static
-      address ${staticIp}/24
-      gateway $GW
-      dns-nameservers $GW
-    EOF
+    printf 'auto enp1s0\\niface enp1s0 inet static\\n  address ${staticIp}/24\\n  gateway %s\\n  dns-nameservers %s\\n' "$GW" "$GW" > /etc/network/interfaces.d/enp1s0
     ip addr flush dev enp1s0
     ip addr add ${staticIp}/24 dev enp1s0
-    ip route add 10.0.0.0/24 dev enp1s0
+    ip route add 10.0.0.0/24 dev enp1s0 2>/dev/null || true
     ip route add default via $GW` : "";
 
   const userData = `#cloud-config
