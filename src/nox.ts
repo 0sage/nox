@@ -238,6 +238,7 @@ function generateCloudInit(name: string, password: string, osName = "debian", st
     EOF
     ip addr flush dev enp1s0
     ip addr add ${staticIp}/24 dev enp1s0
+    ip route add 10.0.0.0/24 dev enp1s0
     ip route add default via $GW` : "";
 
   const userData = `#cloud-config
