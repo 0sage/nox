@@ -1204,8 +1204,6 @@ function cmdUpdate() {
 
   const arch = hostArch();
   const binaryName = `nox-linux-${arch}`;
-  const releaseUrl = `https://github.com/solosmith/nox/releases/download/latest`;
-
   const tmpDir = run("mktemp -d").stdout.trim();
   try {
     const ts = Date.now();
@@ -1220,6 +1218,7 @@ function cmdUpdate() {
       return;
     }
 
+    const releaseUrl = `https://github.com/solosmith/nox/releases/download/v${remoteVersion}`;
     console.log("Downloading updated binary...");
     run(`curl -fsSL -L '${releaseUrl}/${binaryName}' -o ${tmpDir}/nox`);
 

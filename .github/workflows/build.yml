@@ -42,14 +42,14 @@ jobs:
         id: version
         run: echo "version=$(cat VERSION)" >> $GITHUB_OUTPUT
 
-      - name: Delete existing release
+      - name: Delete existing latest tag
         run: gh release delete latest --yes 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create release
+      - name: Create versioned release
         run: |
-          gh release create latest \
+          gh release create "v${{ steps.version.outputs.version }}" \
             --title "nox ${{ steps.version.outputs.version }}" \
             --notes "Automated build from main branch" \
             --latest \
