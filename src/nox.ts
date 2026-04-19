@@ -230,6 +230,7 @@ function generateCloudInit(name: string, password: string, osName = "debian", st
   - |
     GW=$(ip route show default | awk '/default/ {print $3}')
     printf 'auto enp1s0\\niface enp1s0 inet static\\n  address ${staticIp}/24\\n  gateway %s\\n  dns-nameservers %s\\n' "$GW" "$GW" > /etc/network/interfaces.d/enp1s0
+    kill $(cat /run/dhclient.enp1s0.pid 2>/dev/null) 2>/dev/null || true
     ip addr flush dev enp1s0
     ip addr add ${staticIp}/24 dev enp1s0
     ip route add 10.0.0.0/24 dev enp1s0 2>/dev/null || true
