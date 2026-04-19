@@ -196,41 +196,61 @@ enable_kvm() {
 configure_libvirt_network() {
     info "Configuring libvirt networks..."
 
-    if $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "default"; then
-        $SUDO virsh --connect qemu:///system net-start default 2>/dev/null || true
-        $SUDO virsh --connect qemu:///system net-autostart default 2>/dev/null || true
+    # Detect the primary ethernet interface
+    local eth_iface
+    eth_iface=$(ip route show default | awk '/default/ {print $5}' | head -1)
+    if [ -z "$eth_iface" ]; then
+        warn "Could not detect primary network interface — skipping bridge setup"
+        return
     fi
 
-    if ! $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-net"; then
-        info "Creating nox-net network..."
+    # Set up nox-bridge if it doesn't exist
+    if ! ip link show nox-bridge >/dev/null 2>&1; then
+        info "Creating nox-bridge on $eth_iface..."
+        if command -v nmcli >/dev/null 2>&1; then
+            $SUDO nmcli con add type bridge ifname nox-bridge con-name nox-bridge bridge.stp no
+            $SUDO nmcli con modify nox-bridge ipv4.method auto ipv6.method ignore
+            $SUDO nmcli con add type bridge-slave ifname "$eth_iface" master nox-bridge con-name nox-bridge-slave
+            $SUDO nmcli con up nox-bridge
+            $SUDO nmcli con up nox-bridge-slave
+            # Wait for DHCP
+            for i in $(seq 1 15); do
+                if ip addr show nox-bridge | grep -q "inet "; then break; fi
+                sleep 1
+            done
+            info "✓ nox-bridge created"
+        else
+            warn "nmcli not found — cannot create nox-bridge automatically"
+            warn "  Create nox-bridge manually and re-run installer"
+            return
+        fi
+    else
+        info "✓ nox-bridge already exists"
+    fi
 
-        local bridge_num=1
-        while ip link show virbr${bridge_num} >/dev/null 2>&1; do
-            bridge_num=$((bridge_num + 1))
-        done
+    # Define nox-net as a bridge network
+    if $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-net"; then
+        # Check if it's already bridged
+        if $SUDO virsh --connect qemu:///system net-dumpxml nox-net 2>/dev/null | grep -q "mode='bridge'"; then
+            info "✓ nox-net already configured as bridge"
+            return
+        fi
+        # Redefine as bridge
+        $SUDO virsh --connect qemu:///system net-destroy nox-net 2>/dev/null || true
+        $SUDO virsh --connect qemu:///system net-undefine nox-net 2>/dev/null || true
+    fi
 
-        local subnet_third=100
-        while ip route | grep -q "192.168.${subnet_third}."; do
-            subnet_third=$((subnet_third + 1))
-        done
-
-        $SUDO virsh --connect qemu:///system net-define /dev/stdin <<EOF
+    info "Creating nox-net as bridge network..."
+    $SUDO virsh --connect qemu:///system net-define /dev/stdin <<EOF
 <network>
   <name>nox-net</name>
-  <forward mode='nat'/>
-  <bridge name='virbr${bridge_num}' stp='on' delay='0'/>
-  <ip address='192.168.${subnet_third}.1' netmask='255.255.255.0'>
-    <dhcp>
-      <range start='192.168.${subnet_third}.2' end='192.168.${subnet_third}.254'/>
-    </dhcp>
-  </ip>
+  <forward mode='bridge'/>
+  <bridge name='nox-bridge'/>
 </network>
 EOF
-
-        $SUDO virsh --connect qemu:///system net-start nox-net 2>/dev/null || true
-        $SUDO virsh --connect qemu:///system net-autostart nox-net 2>/dev/null || true
-        info "✓ nox-net network created (192.168.${subnet_third}.0/24)"
-    fi
+    $SUDO virsh --connect qemu:///system net-start nox-net 2>/dev/null || true
+    $SUDO virsh --connect qemu:///system net-autostart nox-net 2>/dev/null || true
+    info "✓ nox-net created (bridged to nox-bridge — VMs get LAN IPs)"
 }
 
 # ---------------------------------------------------------------------------
@@ -507,52 +527,33 @@ run_full_verification() {
     section "7. Networking"
     # -----------------------------------------------------------------------
 
-    # NAT forwarding (required for VM internet access)
+    # nox-bridge
+    if ip link show nox-bridge >/dev/null 2>&1; then
+        local bridge_ip=$(ip addr show nox-bridge | awk '/inet / {print $2}' | head -1)
+        if [ -n "$bridge_ip" ]; then
+            check_pass "nox-bridge: up with IP $bridge_ip"
+        else
+            check_warn "nox-bridge: up but no IP assigned yet"
+        fi
+    else
+        check_fail "nox-bridge: NOT FOUND — run installer to create it"
+    fi
+
+    # nox-net bridged mode
+    if _virsh net-dumpxml nox-net 2>/dev/null | grep -q "mode='bridge'"; then
+        check_pass "nox-net: bridged to nox-bridge"
+    else
+        check_warn "nox-net: not in bridge mode — VMs won't get LAN IPs"
+    fi
+
+    # IPv4 forwarding
     if [ -f /proc/sys/net/ipv4/ip_forward ]; then
         local ip_fwd=$(cat /proc/sys/net/ipv4/ip_forward)
         if [ "$ip_fwd" = "1" ]; then
             check_pass "IPv4 forwarding: enabled"
         else
-            check_warn "IPv4 forwarding: disabled — VMs won't have internet access"
+            check_warn "IPv4 forwarding: disabled"
             check_warn "  Enable with: sudo sysctl -w net.ipv4.ip_forward=1"
-        fi
-    else
-        check_warn "Cannot check IPv4 forwarding"
-    fi
-
-    # iptables/nftables (NAT masquerade)
-    if command -v iptables >/dev/null 2>&1; then
-        if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "MASQUERADE"; then
-            check_pass "NAT masquerade: configured (iptables)"
-        elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q "masquerade"; then
-            check_pass "NAT masquerade: configured (nftables)"
-        else
-            check_warn "NAT masquerade: not detected — VM internet may not work"
-        fi
-    elif command -v nft >/dev/null 2>&1; then
-        if nft list ruleset 2>/dev/null | grep -q "masquerade"; then
-            check_pass "NAT masquerade: configured (nftables)"
-        else
-            check_warn "NAT masquerade: not detected — VM internet may not work"
-        fi
-    fi
-
-    # iptables-persistent (port forward persistence across reboots)
-    if command -v iptables-save >/dev/null 2>&1 && [ -d /etc/iptables ]; then
-        check_pass "iptables-persistent: installed"
-    else
-        check_warn "iptables-persistent: NOT FOUND — port forwards won't survive reboots"
-        check_warn "  Install with: sudo apt install iptables-persistent"
-    fi
-
-    # dnsmasq (DHCP for libvirt networks)
-    if pgrep -f "dnsmasq.*libvirt" >/dev/null 2>&1 || pgrep -f "dnsmasq.*virbr" >/dev/null 2>&1; then
-        check_pass "dnsmasq: running for libvirt networks"
-    else
-        if command -v dnsmasq >/dev/null 2>&1; then
-            check_warn "dnsmasq: installed but not running for libvirt — DHCP may not work"
-        else
-            check_fail "dnsmasq: NOT FOUND — VMs won't get IP addresses via DHCP"
         fi
     fi
 

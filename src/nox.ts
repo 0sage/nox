@@ -1038,6 +1038,17 @@ function cmdDoctor() {
 
   let hasActiveNetwork = false;
 
+  // nox-bridge
+  const noxBridge = run("ip link show nox-bridge", false);
+  if (noxBridge.exitCode === 0) {
+    const ipResult = run("ip addr show nox-bridge", false);
+    const ipMatch = ipResult.stdout.match(/inet (\S+)/);
+    if (ipMatch) pass(`nox-bridge: up with IP ${ipMatch[1]}`);
+    else softWarn("nox-bridge: up but no IP assigned");
+  } else {
+    fail("nox-bridge: NOT FOUND — run installer to create it");
+  }
+
   // nox-net
   const noxNetInfo = virsh("net-info nox-net", false);
   if (noxNetInfo.exitCode === 0) {
@@ -1047,43 +1058,23 @@ function cmdDoctor() {
     else softWarn("nox-net: exists but inactive");
     if (autostart) pass("nox-net: autostart enabled");
     else softWarn("nox-net: autostart disabled");
-
-    // DHCP check
     const netXml = virsh("net-dumpxml nox-net", false);
-    if (netXml.stdout.includes("<range")) pass("nox-net: DHCP range configured");
-    else softWarn("nox-net: no DHCP range — VMs won't get IPs");
+    if (netXml.stdout.includes("mode='bridge'")) pass("nox-net: bridged to nox-bridge");
+    else softWarn("nox-net: not in bridge mode — VMs won't get LAN IPs");
   } else {
     softWarn("nox-net: not defined");
   }
 
-  // default
-  const defNetInfo = virsh("net-info default", false);
-  if (defNetInfo.exitCode === 0) {
-    const active = defNetInfo.stdout.split("Active:")[1]?.split("\n")[0]?.includes("yes");
-    if (active) { pass("default network: active"); hasActiveNetwork = true; }
-    else softWarn("default network: inactive");
-  }
-
   if (!hasActiveNetwork) fail("No active libvirt network — VMs cannot get connectivity");
-
-  // iptables-persistent
-  const iptablesPersistent = run("test -d /etc/iptables", false);
-  if (iptablesPersistent.exitCode === 0) pass("iptables-persistent: installed");
-  else softWarn("iptables-persistent: NOT FOUND — port forwards won't survive reboots (apt install iptables-persistent)");
 
   // IP forwarding
   try {
     const ipFwd = readFileSync("/proc/sys/net/ipv4/ip_forward", "utf-8").trim();
     if (ipFwd === "1") pass("IPv4 forwarding: enabled");
-    else softWarn("IPv4 forwarding: disabled — VMs won't have internet");
+    else softWarn("IPv4 forwarding: disabled");
   } catch {
     softWarn("Cannot check IPv4 forwarding");
   }
-
-  // dnsmasq
-  const dnsmasq = run("pgrep -f 'dnsmasq.*(libvirt|virbr)'", false);
-  if (dnsmasq.exitCode === 0) pass("dnsmasq: running for libvirt");
-  else softWarn("dnsmasq: not detected — DHCP may not work");
 
   // -- 7. Permissions --
   console.log("\n── Permissions ──");
