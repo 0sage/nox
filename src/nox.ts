@@ -226,15 +226,19 @@ function generateCloudInit(name: string, password: string, osName = "debian", st
   const sshKey = findSshKey() ?? "";
 
   const staticIpCmds = staticIp ? `
+  - mkdir -p /etc/network/interfaces.d
   - |
+    GW=$(ip route show default | awk '/default/ {print $3}')
     cat > /etc/network/interfaces.d/enp1s0 <<EOF
     auto enp1s0
     iface enp1s0 inet static
-      address ${staticIp}
-      gateway $(ip route show default | awk '/default/ {print $3}')
-      dns-nameservers $(ip route show default | awk '/default/ {print $3}')
+      address ${staticIp}/24
+      gateway $GW
+      dns-nameservers $GW
     EOF
-  - ifdown enp1s0 && ifup enp1s0` : "";
+  - ip addr flush dev enp1s0
+  - ip addr add ${staticIp}/24 dev enp1s0
+  - ip route add default via $(ip route show default | awk '/default/ {print $3}') || true` : "";
 
   const userData = `#cloud-config
 hostname: ${name}
