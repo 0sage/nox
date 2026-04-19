@@ -311,6 +311,14 @@ function createVm(opts: CreateOptions): { success: boolean; password: string | n
   const password = opts.password ?? generatePassword();
   const staticIp = opts.staticIp;
 
+  if (staticIp) {
+    const pingResult = run(`ping -c1 -W1 ${staticIp}`, false);
+    if (pingResult.exitCode === 0) {
+      console.error(`IP ${staticIp} is already in use on the network. Choose a different address.`);
+      process.exit(1);
+    }
+  }
+
   const arch = hostArch();
   const { vcpus, cpuFraction } = resolveCpus(cpusRaw);
   const ramMb = Math.max(1, Math.floor(ramRaw));
