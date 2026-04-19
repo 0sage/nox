@@ -222,8 +222,19 @@ function detectActiveNetwork(): string {
 // Cloud-init
 // ---------------------------------------------------------------------------
 
-function generateCloudInit(name: string, password: string, osName = "debian"): { userData: string; metaData: string } {
+function generateCloudInit(name: string, password: string, osName = "debian", staticIp?: string): { userData: string; metaData: string } {
   const sshKey = findSshKey() ?? "";
+
+  const staticIpCmds = staticIp ? `
+  - |
+    cat > /etc/network/interfaces.d/enp1s0 <<EOF
+    auto enp1s0
+    iface enp1s0 inet static
+      address ${staticIp}
+      gateway $(ip route show default | awk '/default/ {print $3}')
+      dns-nameservers $(ip route show default | awk '/default/ {print $3}')
+    EOF
+  - ifdown enp1s0 && ifup enp1s0` : "";
 
   const userData = `#cloud-config
 hostname: ${name}
@@ -252,7 +263,7 @@ runcmd:
   - systemctl enable qemu-guest-agent
   - systemctl start qemu-guest-agent
   - systemctl enable ssh
-  - systemctl start ssh
+  - systemctl start ssh${staticIpCmds}
 `;
 
   const metaData = `instance-id: ${name}
@@ -276,6 +287,7 @@ interface CreateOptions {
   password?: string;
   start?: boolean;
   network?: string;
+  staticIp?: string;
 }
 
 function createVm(opts: CreateOptions): { success: boolean; password: string | null } {
@@ -297,6 +309,7 @@ function createVm(opts: CreateOptions): { success: boolean; password: string | n
   const startVm = opts.start ?? true;
   const network = opts.network ?? detectActiveNetwork();
   const password = opts.password ?? generatePassword();
+  const staticIp = opts.staticIp;
 
   const arch = hostArch();
   const { vcpus, cpuFraction } = resolveCpus(cpusRaw);
@@ -330,7 +343,7 @@ function createVm(opts: CreateOptions): { success: boolean; password: string | n
   run(`qemu-img create -f qcow2 -F qcow2 -b ${baseImage} ${diskPath} ${diskGb}G`);
 
   // Cloud-init
-  const { userData, metaData } = generateCloudInit(name, password, osName);
+  const { userData, metaData } = generateCloudInit(name, password, osName, staticIp);
   const userDataPath = join(vmPath, "user-data");
   const metaDataPath = join(vmPath, "meta-data");
   writeFileSync(userDataPath, userData);
@@ -372,7 +385,7 @@ function createVm(opts: CreateOptions): { success: boolean; password: string | n
 
   saveMeta(name, {
     name, os: osName, arch, vcpus, cpu_fraction: cpuFraction,
-    ram_mb: ramMb, disk_gb: diskGb, autostart, network,
+    ram_mb: ramMb, disk_gb: diskGb, autostart, network, static_ip: staticIp,
   });
 
   console.log(startVm ? `VM '${name}' created and starting...` : `VM '${name}' created (not started).`);
@@ -392,6 +405,7 @@ function cmdCreate(args: string[]) {
       ram: { type: "string", default: undefined },
       disk: { type: "string", default: undefined },
       network: { type: "string", default: undefined },
+      ip: { type: "string", default: undefined },
       passwd: { type: "string", default: undefined },
       "no-autostart": { type: "boolean", default: false },
       "no-start": { type: "boolean", default: false },
@@ -409,6 +423,7 @@ function cmdCreate(args: string[]) {
     ram: values.ram ? parseFloat(values.ram as string) : undefined,
     disk: values.disk ? parseFloat(values.disk as string) : undefined,
     network: values.network as string | undefined,
+    staticIp: values.ip as string | undefined,
     password: values.passwd as string | undefined,
     autostart: !values["no-autostart"],
     start: !values["no-start"],
@@ -1252,6 +1267,7 @@ Create options:
   --ram N                RAM in MB, fractional or absolute (default: 512)
   --disk N               Disk size in GB (default: 5)
   --network NAME         Libvirt network (default: auto-detect)
+  --ip ADDR              Static IP address (e.g. 10.0.0.50)
   --passwd PASSWORD       Set user password (default: auto-generated)
   --no-autostart         Disable autostart on boot
   --no-start             Create but don't start VM
