@@ -866,14 +866,20 @@ function cmdResize(args: string[]) {
 
   if (needsShutdown) {
     console.log("Note: Resize requires VM shutdown. Stopping VM...");
-    virsh(`shutdown ${name}`);
-    let stopped = false;
-    for (let i = 0; i < 15; i++) {
-      if (vmState(name) === "shut off") { stopped = true; break; }
+    // Wait for guest agent to be ready before sending ACPI shutdown
+    for (let i = 0; i < 40; i++) {
+      const r = virsh(`qemu-agent-command ${name} '{"execute":"guest-ping"}'`, false);
+      if (r.exitCode === 0) break;
       Bun.sleepSync(1000);
     }
+    virsh(`shutdown ${name}`);
+    let stopped = false;
+    for (let i = 0; i < 30; i++) {
+      Bun.sleepSync(1000);
+      if (vmState(name) === "shut off") { stopped = true; break; }
+    }
     if (!stopped) {
-      console.log("Graceful shutdown timed out, forcing stop...");
+      console.log("Forcing stop...");
       virsh(`destroy ${name}`, false);
       Bun.sleepSync(1000);
     }
