@@ -637,19 +637,25 @@ function cmdStats(args: string[]) {
     if (m) cpuTime = parseInt(m[1]);
   }
 
-  // Memory usage
-  virsh(`dommemstat ${name} --period 1 --live`, false);
-  // small delay to let the stat collect
-  Bun.sleepSync(1500);
+  // Memory usage via dommemstat (rss = host-side resident set)
   const memStats = virsh(`dommemstat ${name}`, false);
-  let memTotal = 0, memAvailable = 0, memUsed = 0;
+  let memTotal = 0, memUnused = 0, memUsed = 0, memRss = 0;
   for (const line of memStats.stdout.split("\n")) {
     const parts = line.trim().split(/\s+/);
     if (parts[0] === "actual") memTotal = parseInt(parts[1]) || 0;
-    if (parts[0] === "available") memAvailable = parseInt(parts[1]) || 0;
-    if (parts[0] === "unused") memUsed = memTotal - (parseInt(parts[1]) || 0);
+    if (parts[0] === "unused") memUnused = parseInt(parts[1]) || 0;
+    if (parts[0] === "available") memUnused = parseInt(parts[1]) || memUnused;
+    if (parts[0] === "rss") memRss = parseInt(parts[1]) || 0;
   }
-  if (!memUsed && memAvailable) memUsed = memTotal - memAvailable;
+  if (memTotal > 0 && memUnused > 0) {
+    memUsed = memTotal - memUnused;
+  } else if (memRss > 0) {
+    // No balloon device — use RSS as used, configured RAM as total
+    const domInfo = virsh(`dominfo ${name}`, false);
+    const maxMemMatch = domInfo.stdout.match(/Max memory:\s+(\d+)/);
+    memTotal = maxMemMatch ? parseInt(maxMemMatch[1]) : memRss;
+    memUsed = memRss;
+  }
 
   // Disk usage via domblkinfo
   const blkList = virsh(`domblklist ${name}`, false);
@@ -686,7 +692,7 @@ function cmdStats(args: string[]) {
   console.log(`\nVM '${name}' stats:`);
   console.log(`${"=".repeat(40)}`);
   console.log(`  CPU time:    ${(cpuTime / 1e9).toFixed(1)}s`);
-  console.log(`  RAM:         ${fmtMb(memUsed)} / ${fmtMb(memTotal)} used`);
+  console.log(`  RAM:         ${fmtMb(memUsed)} used (${fmtMb(memTotal)} allocated)`);
   console.log(`  Disk:        ${fmtGb(diskUsed)} / ${fmtGb(diskTotal)} used`);
   console.log(`  Uptime:      ${uptime}`);
   if (meta) {
@@ -862,14 +868,14 @@ function cmdResize(args: string[]) {
     console.log("Note: Resize requires VM shutdown. Stopping VM...");
     virsh(`shutdown ${name}`);
     let stopped = false;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 15; i++) {
       if (vmState(name) === "shut off") { stopped = true; break; }
       Bun.sleepSync(1000);
     }
     if (!stopped) {
       console.log("Graceful shutdown timed out, forcing stop...");
       virsh(`destroy ${name}`, false);
-      Bun.sleepSync(2000);
+      Bun.sleepSync(1000);
     }
     if (vmState(name) !== "shut off") {
       console.error("Failed to stop VM. Cannot resize while running.");
