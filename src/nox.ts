@@ -137,9 +137,7 @@ function saveMeta(name: string, meta: Record<string, any>) {
 
 function vmIp(name: string, timeout = 60): string | null {
   const ips = vmIps(name, timeout);
-  // Prefer local network IPs, skip Tailscale (100.64.0.0/10) and other overlay ranges
-  const localIp = ips.find(ip => !ip.startsWith("100."));
-  return localIp ?? ips[0] ?? null;
+  return ips[0] ?? null;
 }
 
 function vmIps(name: string, timeout = 60): string[] {
@@ -205,15 +203,11 @@ function ensureSshKey() {
 }
 
 function detectActiveNetwork(): string {
-  const result = virsh("net-info nox-net", false);
-  if (result.exitCode === 0) {
-    const activeLine = result.stdout.split("Active:")[1]?.split("\n")[0] ?? "";
-    if (activeLine.includes("yes")) return "nox-net";
-  }
-  const defResult = virsh("net-info default", false);
-  if (defResult.exitCode === 0) {
-    const activeLine = defResult.stdout.split("Active:")[1]?.split("\n")[0] ?? "";
-    if (activeLine.includes("yes")) return "default";
+  for (const net of ["nox-nat", "default"]) {
+    const result = virsh(`net-info ${net}`, false);
+    if (result.exitCode === 0 && result.stdout.split("Active:")[1]?.split("\n")[0]?.includes("yes")) {
+      return net;
+    }
   }
   return "default";
 }
@@ -222,19 +216,8 @@ function detectActiveNetwork(): string {
 // Cloud-init
 // ---------------------------------------------------------------------------
 
-function generateCloudInit(name: string, password: string, osName = "debian", staticIp?: string): { userData: string; metaData: string } {
+function generateCloudInit(name: string, password: string, osName = "debian"): { userData: string; metaData: string } {
   const sshKey = findSshKey() ?? "";
-
-  const staticIpCmds = staticIp ? `
-  - mkdir -p /etc/network/interfaces.d
-  - |
-    GW=$(ip route show default | awk '/default/ {print $3}')
-    printf 'auto enp1s0\\niface enp1s0 inet static\\n  address ${staticIp}/24\\n  gateway %s\\n  dns-nameservers %s\\n' "$GW" "$GW" > /etc/network/interfaces.d/enp1s0
-    kill $(cat /run/dhclient.enp1s0.pid 2>/dev/null) 2>/dev/null || true
-    ip addr flush dev enp1s0
-    ip addr add ${staticIp}/24 dev enp1s0
-    ip route add 10.0.0.0/24 dev enp1s0 2>/dev/null || true
-    ip route add default via $GW` : "";
 
   const userData = `#cloud-config
 hostname: ${name}
@@ -263,7 +246,7 @@ runcmd:
   - systemctl enable qemu-guest-agent
   - systemctl start qemu-guest-agent
   - systemctl enable ssh
-  - systemctl start ssh${staticIpCmds}
+  - systemctl start ssh
 `;
 
   const metaData = `instance-id: ${name}
@@ -287,7 +270,6 @@ interface CreateOptions {
   password?: string;
   start?: boolean;
   network?: string;
-  staticIp?: string;
 }
 
 function createVm(opts: CreateOptions): { success: boolean; password: string | null } {
@@ -309,15 +291,6 @@ function createVm(opts: CreateOptions): { success: boolean; password: string | n
   const startVm = opts.start ?? true;
   const network = opts.network ?? detectActiveNetwork();
   const password = opts.password ?? generatePassword();
-  const staticIp = opts.staticIp;
-
-  if (staticIp) {
-    const pingResult = run(`ping -c1 -W1 ${staticIp}`, false);
-    if (pingResult.exitCode === 0) {
-      console.error(`IP ${staticIp} is already in use on the network. Choose a different address.`);
-      process.exit(1);
-    }
-  }
 
   const arch = hostArch();
   const { vcpus, cpuFraction } = resolveCpus(cpusRaw);
@@ -351,7 +324,7 @@ function createVm(opts: CreateOptions): { success: boolean; password: string | n
   run(`qemu-img create -f qcow2 -F qcow2 -b ${baseImage} ${diskPath} ${diskGb}G`);
 
   // Cloud-init
-  const { userData, metaData } = generateCloudInit(name, password, osName, staticIp);
+  const { userData, metaData } = generateCloudInit(name, password, osName);
   const userDataPath = join(vmPath, "user-data");
   const metaDataPath = join(vmPath, "meta-data");
   writeFileSync(userDataPath, userData);
@@ -393,7 +366,7 @@ function createVm(opts: CreateOptions): { success: boolean; password: string | n
 
   saveMeta(name, {
     name, os: osName, arch, vcpus, cpu_fraction: cpuFraction,
-    ram_mb: ramMb, disk_gb: diskGb, autostart, network, static_ip: staticIp,
+    ram_mb: ramMb, disk_gb: diskGb, autostart, network,
   });
 
   console.log(startVm ? `VM '${name}' created and starting...` : `VM '${name}' created (not started).`);
@@ -413,7 +386,6 @@ function cmdCreate(args: string[]) {
       ram: { type: "string", default: undefined },
       disk: { type: "string", default: undefined },
       network: { type: "string", default: undefined },
-      ip: { type: "string", default: undefined },
       passwd: { type: "string", default: undefined },
       "no-autostart": { type: "boolean", default: false },
       "no-start": { type: "boolean", default: false },
@@ -431,7 +403,6 @@ function cmdCreate(args: string[]) {
     ram: values.ram ? parseFloat(values.ram as string) : undefined,
     disk: values.disk ? parseFloat(values.disk as string) : undefined,
     network: values.network as string | undefined,
-    staticIp: values.ip as string | undefined,
     password: values.passwd as string | undefined,
     autostart: !values["no-autostart"],
     start: !values["no-start"],
@@ -441,28 +412,14 @@ function cmdCreate(args: string[]) {
 
   if (!values["no-start"]) {
     console.log("\nWaiting for VM to boot and get IP address...");
-    const staticIp = values.ip as string | undefined;
-    let ip: string | null = null;
-
-    if (staticIp) {
-      // Wait for cloud-init to apply the static IP
-      const deadline = Date.now() + 180 * 1000;
-      while (Date.now() < deadline) {
-        const current = vmIp(name, 10);
-        if (current === staticIp) { ip = current; break; }
-        Bun.sleepSync(3000);
-      }
-      if (!ip) ip = vmIp(name, 5) ?? staticIp; // fallback: show static IP anyway
-    } else {
-      ip = vmIp(name, 180);
-    }
+    const ip = vmIp(name, 180);
 
     console.log(`\n${"=".repeat(60)}`);
     console.log(`VM '${name}' is ready!`);
     console.log(`${"=".repeat(60)}`);
     console.log(`\nSSH Access (password shown once):`);
     console.log(`  Password: ${password}`);
-    if (ip) console.log(`  LAN IP:   ${ip}`);
+    if (ip) console.log(`  IP:       ${ip}`);
     else console.log(`  IP not detected yet. Use 'nox list' to find it.`);
     console.log(`\nConnect via SSH:`);
     console.log(`  nox ssh ${name}`);
@@ -1075,31 +1032,29 @@ function cmdDoctor() {
 
   let hasActiveNetwork = false;
 
-  // nox-bridge
-  const noxBridge = run("ip link show nox-bridge", false);
-  if (noxBridge.exitCode === 0) {
-    const ipResult = run("ip addr show nox-bridge", false);
-    const ipMatch = ipResult.stdout.match(/inet (\S+)/);
-    if (ipMatch) pass(`nox-bridge: up with IP ${ipMatch[1]}`);
-    else softWarn("nox-bridge: up but no IP assigned");
+  // nox-nat
+  const noxNatInfo = virsh("net-info nox-nat", false);
+  if (noxNatInfo.exitCode === 0) {
+    const active = noxNatInfo.stdout.split("Active:")[1]?.split("\n")[0]?.includes("yes");
+    const autostart = noxNatInfo.stdout.split("Autostart:")[1]?.split("\n")[0]?.includes("yes");
+    if (active) { pass("nox-nat: active"); hasActiveNetwork = true; }
+    else softWarn("nox-nat: exists but inactive — start with: virsh net-start nox-nat");
+    if (autostart) pass("nox-nat: autostart enabled");
+    else softWarn("nox-nat: autostart disabled");
+    const netXml = virsh("net-dumpxml nox-nat", false);
+    if (netXml.stdout.includes("mode='nat'") || netXml.stdout.includes("<nat>") || netXml.stdout.includes("<forward mode='nat'")) {
+      pass("nox-nat: NAT mode configured");
+    } else {
+      softWarn("nox-nat: unexpected network mode");
+    }
   } else {
-    fail("nox-bridge: NOT FOUND — run installer to create it");
-  }
-
-  // nox-net
-  const noxNetInfo = virsh("net-info nox-net", false);
-  if (noxNetInfo.exitCode === 0) {
-    const active = noxNetInfo.stdout.split("Active:")[1]?.split("\n")[0]?.includes("yes");
-    const autostart = noxNetInfo.stdout.split("Autostart:")[1]?.split("\n")[0]?.includes("yes");
-    if (active) { pass("nox-net: active"); hasActiveNetwork = true; }
-    else softWarn("nox-net: exists but inactive");
-    if (autostart) pass("nox-net: autostart enabled");
-    else softWarn("nox-net: autostart disabled");
-    const netXml = virsh("net-dumpxml nox-net", false);
-    if (netXml.stdout.includes("mode='bridge'")) pass("nox-net: bridged to nox-bridge");
-    else softWarn("nox-net: not in bridge mode — VMs won't get LAN IPs");
-  } else {
-    softWarn("nox-net: not defined");
+    softWarn("nox-nat: not defined — run installer to create it");
+    // fall back to default
+    const defInfo = virsh("net-info default", false);
+    if (defInfo.exitCode === 0 && defInfo.stdout.split("Active:")[1]?.split("\n")[0]?.includes("yes")) {
+      pass("default network: active (fallback)");
+      hasActiveNetwork = true;
+    }
   }
 
   if (!hasActiveNetwork) fail("No active libvirt network — VMs cannot get connectivity");
@@ -1288,7 +1243,6 @@ Create options:
   --ram N                RAM in MB, fractional or absolute (default: 512)
   --disk N               Disk size in GB (default: 5)
   --network NAME         Libvirt network (default: auto-detect)
-  --ip ADDR              Static IP address (e.g. 10.0.0.50)
   --passwd PASSWORD       Set user password (default: auto-generated)
   --no-autostart         Disable autostart on boot
   --no-start             Create but don't start VM

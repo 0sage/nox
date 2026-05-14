@@ -194,63 +194,49 @@ enable_kvm() {
 # ---------------------------------------------------------------------------
 
 configure_libvirt_network() {
-    info "Configuring libvirt networks..."
+    info "Configuring libvirt NAT network..."
 
-    # Detect the primary ethernet interface
-    local eth_iface
-    eth_iface=$(ip route show default | awk '/default/ {print $5}' | head -1)
-    if [ -z "$eth_iface" ]; then
-        warn "Could not detect primary network interface — skipping bridge setup"
-        return
+    # Enable IP forwarding
+    $SUDO sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
+        echo "net.ipv4.ip_forward=1" | $SUDO tee -a /etc/sysctl.conf >/dev/null
     fi
 
-    # Set up nox-bridge if it doesn't exist
-    if ! ip link show nox-bridge >/dev/null 2>&1; then
-        info "Creating nox-bridge on $eth_iface..."
-        if command -v nmcli >/dev/null 2>&1; then
-            $SUDO nmcli con add type bridge ifname nox-bridge con-name nox-bridge bridge.stp no
-            $SUDO nmcli con modify nox-bridge ipv4.method auto ipv6.method ignore
-            $SUDO nmcli con add type bridge-slave ifname "$eth_iface" master nox-bridge con-name nox-bridge-slave
-            $SUDO nmcli con up nox-bridge
-            $SUDO nmcli con up nox-bridge-slave
-            # Wait for DHCP
-            for i in $(seq 1 15); do
-                if ip addr show nox-bridge | grep -q "inet "; then break; fi
-                sleep 1
-            done
-            info "✓ nox-bridge created"
-        else
-            warn "nmcli not found — cannot create nox-bridge automatically"
-            warn "  Create nox-bridge manually and re-run installer"
-            return
-        fi
-    else
-        info "✓ nox-bridge already exists"
-    fi
-
-    # Define nox-net as a bridge network
+    # Remove old bridge-mode nox-net if present
     if $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-net"; then
-        # Check if it's already bridged
-        if $SUDO virsh --connect qemu:///system net-dumpxml nox-net 2>/dev/null | grep -q "mode='bridge'"; then
-            info "✓ nox-net already configured as bridge"
-            return
-        fi
-        # Redefine as bridge
+        info "Removing old nox-net (bridge mode)..."
         $SUDO virsh --connect qemu:///system net-destroy nox-net 2>/dev/null || true
         $SUDO virsh --connect qemu:///system net-undefine nox-net 2>/dev/null || true
     fi
 
-    info "Creating nox-net as bridge network..."
-    $SUDO virsh --connect qemu:///system net-define /dev/stdin <<EOF
+    # Check if nox-nat already exists and is correct
+    if $SUDO virsh --connect qemu:///system net-list --all 2>/dev/null | grep -q "nox-nat"; then
+        if $SUDO virsh --connect qemu:///system net-dumpxml nox-nat 2>/dev/null | grep -q "mode='nat'"; then
+            info "✓ nox-nat already configured"
+            $SUDO virsh --connect qemu:///system net-start nox-nat 2>/dev/null || true
+            $SUDO virsh --connect qemu:///system net-autostart nox-nat 2>/dev/null || true
+            return
+        fi
+        $SUDO virsh --connect qemu:///system net-destroy nox-nat 2>/dev/null || true
+        $SUDO virsh --connect qemu:///system net-undefine nox-nat 2>/dev/null || true
+    fi
+
+    info "Creating nox-nat (NAT, 192.168.100.0/24)..."
+    $SUDO virsh --connect qemu:///system net-define /dev/stdin <<'EOF'
 <network>
-  <name>nox-net</name>
-  <forward mode='bridge'/>
-  <bridge name='nox-bridge'/>
+  <name>nox-nat</name>
+  <forward mode='nat'/>
+  <bridge name='virbr-nox' stp='on' delay='0'/>
+  <ip address='192.168.100.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.100.10' end='192.168.100.254'/>
+    </dhcp>
+  </ip>
 </network>
 EOF
-    $SUDO virsh --connect qemu:///system net-start nox-net 2>/dev/null || true
-    $SUDO virsh --connect qemu:///system net-autostart nox-net 2>/dev/null || true
-    info "✓ nox-net created (bridged to nox-bridge — VMs get LAN IPs)"
+    $SUDO virsh --connect qemu:///system net-start nox-nat 2>/dev/null || true
+    $SUDO virsh --connect qemu:///system net-autostart nox-nat 2>/dev/null || true
+    info "✓ nox-nat created (NAT — VMs get 192.168.100.x IPs, isolated from LAN)"
 }
 
 # ---------------------------------------------------------------------------
@@ -527,23 +513,17 @@ run_full_verification() {
     section "7. Networking"
     # -----------------------------------------------------------------------
 
-    # nox-bridge
-    if ip link show nox-bridge >/dev/null 2>&1; then
-        local bridge_ip=$(ip addr show nox-bridge | awk '/inet / {print $2}' | head -1)
-        if [ -n "$bridge_ip" ]; then
-            check_pass "nox-bridge: up with IP $bridge_ip"
-        else
-            check_warn "nox-bridge: up but no IP assigned yet"
-        fi
+    # nox-nat
+    if _virsh net-info nox-nat 2>/dev/null | grep -q "Active:.*yes"; then
+        check_pass "nox-nat: active"
     else
-        check_fail "nox-bridge: NOT FOUND — run installer to create it"
+        check_warn "nox-nat: not active — run installer to create it"
     fi
 
-    # nox-net bridged mode
-    if _virsh net-dumpxml nox-net 2>/dev/null | grep -q "mode='bridge'"; then
-        check_pass "nox-net: bridged to nox-bridge"
+    if _virsh net-dumpxml nox-nat 2>/dev/null | grep -q "mode='nat'"; then
+        check_pass "nox-nat: NAT mode configured (VMs isolated from LAN)"
     else
-        check_warn "nox-net: not in bridge mode — VMs won't get LAN IPs"
+        check_warn "nox-nat: not in NAT mode or not defined"
     fi
 
     # IPv4 forwarding
