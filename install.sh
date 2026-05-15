@@ -38,7 +38,7 @@ fi
 
 GITHUB_REPO="0sage/nox"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/$GITHUB_REPO/main"
-GITHUB_RELEASE_URL="https://github.com/$GITHUB_REPO/releases/download/latest"
+GITHUB_RELEASE_URL="https://github.com/$GITHUB_REPO/releases/download"
 CURRENT_USER=$(whoami)
 HOME_DIR=$(eval echo "~$CURRENT_USER")
 
@@ -862,7 +862,9 @@ main() {
             rm -rf "$TEMP_DIR"
             exit 1
         }
-        curl -fsSL -L "$GITHUB_RELEASE_URL/$binary_name" -o "$TEMP_DIR/nox" || {
+        local version
+        version="v$(cat "$TEMP_DIR/VERSION")"
+        curl -fsSL -L "$GITHUB_RELEASE_URL/$version/$binary_name" -o "$TEMP_DIR/nox" || {
             error "Failed to download nox binary from GitHub Releases"
             rm -rf "$TEMP_DIR"
             exit 1
@@ -873,7 +875,9 @@ main() {
             rm -rf "$TEMP_DIR"
             exit 1
         }
-        wget -q "$GITHUB_RELEASE_URL/$binary_name" -O "$TEMP_DIR/nox" || {
+        local version
+        version="v$(cat "$TEMP_DIR/VERSION")"
+        wget -q "$GITHUB_RELEASE_URL/$version/$binary_name" -O "$TEMP_DIR/nox" || {
             error "Failed to download nox binary from GitHub Releases"
             rm -rf "$TEMP_DIR"
             exit 1
