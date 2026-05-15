@@ -5,7 +5,7 @@ Lightweight VM manager for Linux using KVM/libvirt. Built with Bun/TypeScript.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/solosmith/nox/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/0sage/nox/main/install.sh | bash
 ```
 
 ## Commands

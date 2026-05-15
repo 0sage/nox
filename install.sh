@@ -36,7 +36,7 @@ else
     SUDO=""
 fi
 
-GITHUB_REPO="solosmith/nox"
+GITHUB_REPO="0sage/nox"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/$GITHUB_REPO/main"
 GITHUB_RELEASE_URL="https://github.com/$GITHUB_REPO/releases/download/latest"
 CURRENT_USER=$(whoami)
@@ -931,7 +931,7 @@ main() {
     info "  nox ssh myvm"
     info ""
     info "Update nox: nox update"
-    info "For more: https://github.com/solosmith/nox"
+    info "For more: https://github.com/0sage/nox"
 }
 
 main "$@"
