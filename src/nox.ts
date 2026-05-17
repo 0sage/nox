@@ -1261,7 +1261,7 @@ Commands:
   run <name> <command>   Run a command inside VM via SSH
   passwd <name>          Change SSH password
   resize <name> [opts]   Resize VM resources
-  forward <name> <hp:vp> Forward host port to VM port
+  forward <name> <hp:vp> Forward host port to VM port (alias: fw)
   update|up              Update nox
   doctor                 Run comprehensive system health checks
 
@@ -1321,6 +1321,7 @@ async function main() {
     case "passwd":   cmdPasswd(rest); break;
     case "resize":   cmdResize(rest); break;
     case "forward":  cmdForward(rest); break;
+    case "fw":       cmdForward(rest); break;
     case "update":
     case "up":       cmdUpdate(); break;
     case "doctor":   cmdDoctor(); break;
