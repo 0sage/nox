@@ -470,9 +470,8 @@ function cmdDelete(args: string[]) {
 
   const delMeta = loadMeta(name);
   if (delMeta?.forwards?.length) {
-    const ip = vmIp(name, 5);
-    if (ip) {
-      for (const f of delMeta.forwards) iptablesForwardRemove(ip, f.host_port, f.vm_port, f.proto);
+    for (const f of delMeta.forwards) {
+      if (f.vm_ip) iptablesForwardRemove(f.vm_ip, f.host_port, f.vm_port, f.proto);
     }
   }
 
@@ -758,12 +757,13 @@ function cmdPasswd(args: string[]) {
 }
 
 function iptablesSave() {
-  run("sudo /sbin/iptables-save > /etc/iptables/rules.v4", false);
+  run("sudo sh -c '/sbin/iptables-save > /etc/iptables/rules.v4'", false);
 }
 
 function iptablesForwardAdd(vmIp: string, hostPort: number, vmPort: number, proto: string) {
   run(`sudo /sbin/iptables -t nat -A PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`);
-  run(`sudo /sbin/iptables -A FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`);
+  run(`sudo /sbin/iptables -I FORWARD 1 -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`);
+  run(`sudo /sbin/iptables -t nat -A POSTROUTING -p ${proto} -d ${vmIp} --dport ${vmPort} -j MASQUERADE`);
   run(`sudo /sbin/iptables -t nat -A OUTPUT -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`);
   iptablesSave();
 }
@@ -771,6 +771,7 @@ function iptablesForwardAdd(vmIp: string, hostPort: number, vmPort: number, prot
 function iptablesForwardRemove(vmIp: string, hostPort: number, vmPort: number, proto: string) {
   run(`sudo /sbin/iptables -t nat -D PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`, false);
   run(`sudo /sbin/iptables -D FORWARD -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`, false);
+  run(`sudo /sbin/iptables -t nat -D POSTROUTING -p ${proto} -d ${vmIp} --dport ${vmPort} -j MASQUERADE`, false);
   run(`sudo /sbin/iptables -t nat -D OUTPUT -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`, false);
   iptablesSave();
 }
@@ -781,6 +782,7 @@ function cmdForward(args: string[]) {
     options: {
       proto: { type: "string", default: "tcp" },
       remove: { type: "boolean", default: false },
+      "remove-all": { type: "boolean", default: false },
       list: { type: "boolean", default: false },
     },
     allowPositionals: true,
@@ -790,17 +792,31 @@ function cmdForward(args: string[]) {
   if (!name || !vmExists(name)) { console.error(`VM '${name}' does not exist.`); process.exit(1); }
 
   const meta = loadMeta(name) ?? {};
-  const forwards: Array<{ host_port: number; vm_port: number; proto: string }> = meta.forwards ?? [];
+  const forwards: Array<{ host_port: number; vm_port: number; proto: string; vm_ip?: string }> = meta.forwards ?? [];
 
   if (values.list) {
     if (forwards.length === 0) { console.log(`No port forwards for '${name}'.`); return; }
     console.log(`Port forwards for '${name}':`);
-    for (const f of forwards) console.log(`  ${f.proto.toUpperCase()}  host:${f.host_port} → vm:${f.vm_port}`);
+    for (const f of forwards) {
+      const dest = f.vm_ip ? `${f.vm_ip}:${f.vm_port}` : `vm:${f.vm_port}`;
+      console.log(`  ${f.proto.toUpperCase()}  host:${f.host_port} → ${dest}`);
+    }
+    return;
+  }
+
+  if (values["remove-all"]) {
+    if (forwards.length === 0) { console.log(`No port forwards for '${name}'.`); return; }
+    for (const f of forwards) {
+      if (f.vm_ip) iptablesForwardRemove(f.vm_ip, f.host_port, f.vm_port, f.proto);
+    }
+    meta.forwards = [];
+    saveMeta(name, meta);
+    console.log(`✓ Removed all ${forwards.length} forward(s) for '${name}'.`);
     return;
   }
 
   const mapping = positionals[1];
-  if (!mapping) { console.error("Usage: nox forward <name> <host_port>:<vm_port> [--proto tcp|udp] [--remove]"); process.exit(1); }
+  if (!mapping) { console.error("Usage: nox forward <name> <host_port>:<vm_port> [--proto tcp|udp] [--remove] [--remove-all] [--list]"); process.exit(1); }
 
   const [hostPortStr, vmPortStr] = mapping.split(":");
   const hostPort = parseInt(hostPortStr);
@@ -810,7 +826,8 @@ function cmdForward(args: string[]) {
   if (isNaN(hostPort) || isNaN(vmPort)) { console.error("Invalid port mapping. Use format: 8080:80"); process.exit(1); }
 
   if (values.remove) {
-    const ip = vmIp(name, 5);
+    const target = forwards.find(f => f.host_port === hostPort && f.vm_port === vmPort && f.proto === proto);
+    const ip = target?.vm_ip ?? vmIp(name, 5);
     if (ip) iptablesForwardRemove(ip, hostPort, vmPort, proto);
     meta.forwards = forwards.filter(f => !(f.host_port === hostPort && f.vm_port === vmPort && f.proto === proto));
     saveMeta(name, meta);
@@ -829,7 +846,7 @@ function cmdForward(args: string[]) {
   }
 
   iptablesForwardAdd(ip, hostPort, vmPort, proto);
-  forwards.push({ host_port: hostPort, vm_port: vmPort, proto });
+  forwards.push({ host_port: hostPort, vm_port: vmPort, proto, vm_ip: ip });
   meta.forwards = forwards;
   saveMeta(name, meta);
 
@@ -1265,7 +1282,8 @@ Resize options:
 
 Forward options:
   --proto tcp|udp        Protocol (default: tcp)
-  --remove               Remove the forward rule
+  --remove               Remove a specific forward rule
+  --remove-all           Remove all forward rules for a VM
   --list                 List all forwards for a VM`);
 }
 
