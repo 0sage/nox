@@ -4,7 +4,7 @@
  * Rewritten in TypeScript for Bun runtime
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { homedir, arch as osArch } from "os";
 import { parseArgs } from "util";
@@ -760,6 +760,33 @@ function iptablesSave() {
   run("sudo sh -c '/sbin/iptables-save > /etc/iptables/rules.v4'", false);
 }
 
+function hostPortInUse(port: number, proto: string): { inUse: boolean; detail?: string } {
+  const flag = proto === "udp" ? "-uln" : "-tln";
+  const result = run(`ss ${flag}`, false);
+  if (result.exitCode !== 0) return { inUse: false };
+  for (const line of result.stdout.split("\n")) {
+    const match = line.match(/[\d.:*\[\]]*:(\d+)\s/);
+    if (match && parseInt(match[1]) === port) {
+      return { inUse: true, detail: line.trim() };
+    }
+  }
+  return { inUse: false };
+}
+
+function findForwardOnHostPort(port: number, proto: string): { vm: string; vm_port: number } | null {
+  if (!existsSync(VMS_DIR)) return null;
+  for (const entry of readdirSync(VMS_DIR)) {
+    const meta = loadMeta(entry);
+    const forwards: Array<{ host_port: number; vm_port: number; proto: string }> = meta?.forwards ?? [];
+    for (const f of forwards) {
+      if (f.host_port === port && f.proto === proto) {
+        return { vm: entry, vm_port: f.vm_port };
+      }
+    }
+  }
+  return null;
+}
+
 function iptablesForwardAdd(vmIp: string, hostPort: number, vmPort: number, proto: string) {
   run(`sudo /sbin/iptables -t nat -A PREROUTING -p ${proto} --dport ${hostPort} -j DNAT --to-destination ${vmIp}:${vmPort}`);
   run(`sudo /sbin/iptables -I FORWARD 1 -p ${proto} -d ${vmIp} --dport ${vmPort} -j ACCEPT`);
@@ -842,6 +869,20 @@ function cmdForward(args: string[]) {
 
   if (forwards.some(f => f.host_port === hostPort && f.proto === proto)) {
     console.error(`Host port ${hostPort}/${proto} is already forwarded for this VM.`);
+    process.exit(1);
+  }
+
+  const otherVm = findForwardOnHostPort(hostPort, proto);
+  if (otherVm && otherVm.vm !== name) {
+    console.error(`Host port ${hostPort}/${proto} is already forwarded to VM '${otherVm.vm}' (port ${otherVm.vm_port}).`);
+    console.error(`Remove that forward first: nox fw ${otherVm.vm} ${hostPort}:${otherVm.vm_port}${proto === "udp" ? " --proto udp" : ""} --remove`);
+    process.exit(1);
+  }
+
+  const portCheck = hostPortInUse(hostPort, proto);
+  if (portCheck.inUse) {
+    console.error(`Host port ${hostPort}/${proto} is already in use on this host:`);
+    console.error(`  ${portCheck.detail}`);
     process.exit(1);
   }
 
